@@ -123,22 +123,28 @@ def run_job(db: Session, job: AnalysisJob, *, timeout_seconds: int = 60) -> Anal
         timeout_seconds=timeout_seconds,
     )
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
+    # Not a `with` block: exiting one waits for the worker thread, so a hung executor would block
+    # the request. shutdown(wait=False) returns at once. Python cannot stop the thread, so a
+    # timed-out executor keeps running in the background. Its result is discarded, and only this
+    # function writes the job, so a late result cannot change the recorded status.
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
         future = pool.submit(executor.run, request)
-        try:
-            result = future.result(timeout=timeout_seconds)
-        except TimeoutError:
-            _transition(job, JobStatus.timed_out)
-            job.error = "execution exceeded timeout"
-            job.finished_at = datetime.now(UTC)
-            db.flush()
-            return job
-        except Exception as exc:  # executor raised
-            _transition(job, JobStatus.failed)
-            job.error = str(exc)
-            job.finished_at = datetime.now(UTC)
-            db.flush()
-            return job
+        result = future.result(timeout=timeout_seconds)
+    except TimeoutError:
+        _transition(job, JobStatus.timed_out)
+        job.error = "execution exceeded timeout"
+        job.finished_at = datetime.now(UTC)
+        db.flush()
+        return job
+    except Exception as exc:  # executor raised
+        _transition(job, JobStatus.failed)
+        job.error = str(exc)
+        job.finished_at = datetime.now(UTC)
+        db.flush()
+        return job
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     _transition(job, JobStatus.completed if result.status == "completed" else JobStatus.failed)
     job.result = result.observations
