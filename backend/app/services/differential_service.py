@@ -14,6 +14,7 @@ from app.models import (
     Sample,
 )
 from app.services import job_service, telemetry_service
+from app.services.emergency_service import EmergencyStopActive, ensure_not_active
 
 
 class UnknownSample(Exception):
@@ -60,12 +61,23 @@ def _job_unsuccessful(
     """
     if job.status == JobStatus.completed:
         return False
-    verb = "timed out" if job.status == JobStatus.timed_out else "failed"
+    if job.status == JobStatus.cancelled:
+        verb = "was not started (emergency stop)"
+    elif job.status == JobStatus.timed_out:
+        verb = "timed out"
+    else:
+        verb = "failed"
     analysis.status = JobStatus.failed
     analysis.error_message = f"{label} run {verb}. The other runs were not compared."
     analysis.finished_at = datetime.now(UTC)
     db.flush()
     return True
+
+
+EMERGENCY_MID_RUN = (
+    "Emergency stop was activated during this analysis. Runs not yet started were skipped, "
+    "so no comparison was made."
+)
 
 
 def run_differential(
@@ -78,10 +90,15 @@ def run_differential(
     submitted_by: int | None,
     timeout_seconds: int = 60,
 ) -> DifferentialAnalysis:
-    """Run a baseline plus one variant per variation, comparing each to the
-    baseline and recording observed behavioral dependencies with confidence."""
+    """Run a baseline plus one variant per variation, comparing each to the baseline and
+    recording observed behavioral dependencies with confidence.
+
+    A refusal before the analysis is committed creates no records. A refusal after that marks the
+    analysis failed. Runs that already completed stay recorded.
+    """
     if db.get(Sample, sample_id) is None:
         raise UnknownSample()
+    ensure_not_active(db)
 
     analysis = DifferentialAnalysis(
         sample_id=sample_id,
@@ -91,8 +108,36 @@ def run_differential(
         created_by=submitted_by,
     )
     db.add(analysis)
-    db.flush()
+    db.commit()  # admitted; release the admission lock before any run executes
+    try:
+        result = _run_admitted(
+            db,
+            analysis,
+            baseline_conditions=baseline_conditions,
+            variations=variations,
+            submitted_by=submitted_by,
+            timeout_seconds=timeout_seconds,
+        )
+        db.commit()  # persist outcome, findings, and job states together
+        return result
+    except EmergencyStopActive:
+        db.rollback()
+        analysis.status = JobStatus.failed
+        analysis.error_message = EMERGENCY_MID_RUN
+        analysis.finished_at = datetime.now(UTC)
+        db.commit()
+        return analysis
 
+
+def _run_admitted(
+    db: Session,
+    analysis: DifferentialAnalysis,
+    *,
+    baseline_conditions: dict[str, Any],
+    variations: list[dict[str, Any]],
+    submitted_by: int | None,
+    timeout_seconds: int,
+) -> DifferentialAnalysis:
     # Run every job before comparing anything. If any job did not complete, the analysis fails and
     # no comparison or finding is produced from partial results.
     baseline_job = _run_variant(db, analysis, baseline_conditions, submitted_by, timeout_seconds)

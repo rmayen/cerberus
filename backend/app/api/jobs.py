@@ -14,7 +14,10 @@ from app.services import (
     report_service,
     telemetry_service,
 )
+from app.services.emergency_service import EmergencyStopActive
 from app.services.job_service import UnknownExecutorRequested, UnknownSample
+
+EMERGENCY_MESSAGE = "emergency stop is active; new analysis is disabled"
 
 router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
 
@@ -38,6 +41,9 @@ def submit_job(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "sample not found") from exc
     except UnknownExecutorRequested as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"unknown executor: {exc}") from exc
+    except EmergencyStopActive as exc:
+        db.rollback()
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, EMERGENCY_MESSAGE) from exc
 
     job_service.run_job(db, job, timeout_seconds=body.timeout_seconds)
     audit.record(

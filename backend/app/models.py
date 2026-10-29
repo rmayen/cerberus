@@ -336,3 +336,19 @@ class Sample(Base):
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class EmergencyStop(Base):
+    """Single-row platform switch. While active, no new analysis jobs or differential runs start.
+
+    Existing job records are never changed by it.
+    """
+
+    __tablename__ = "emergency_stop"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    changed_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

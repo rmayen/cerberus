@@ -5,7 +5,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
-from app.api import auth, cases, differential, jobs, samples, users
+from app.api import auth, cases, differential, emergency, jobs, samples, users
 from app.config import settings
 
 SECURITY_HEADERS = {
@@ -44,6 +44,7 @@ def create_app() -> FastAPI:
     app.include_router(samples.router)
     app.include_router(jobs.router)
     app.include_router(differential.router)
+    app.include_router(emergency.router)
 
     return app
 

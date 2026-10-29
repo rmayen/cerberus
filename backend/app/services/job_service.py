@@ -12,6 +12,7 @@ from app.executors.base import ExecutionRequest, Executor
 from app.executors.registry import UnknownExecutor, get_executor
 from app.models import JOB_TRANSITIONS, AnalysisJob, JobStatus, Sample
 from app.services import attack_service, behavior_service, ioc_service, telemetry_service
+from app.services.emergency_service import EmergencyStopActive, ensure_not_active
 from app.storage import storage
 from app.telemetry.normalizer import normalize
 
@@ -87,6 +88,7 @@ def create_job(
     conditions: dict[str, Any],
     submitted_by: int | None,
 ) -> AnalysisJob:
+    ensure_not_active(db)
     if db.get(Sample, sample_id) is None:
         raise UnknownSample()
     try:
@@ -102,6 +104,7 @@ def create_job(
     )
     db.add(job)
     db.flush()
+    db.commit()  # admitted: the record exists, and the admission lock is released
     return job
 
 
@@ -113,9 +116,18 @@ def run_job(db: Session, job: AnalysisJob, *, timeout_seconds: int = 60) -> Anal
         raise UnknownSample()
     executor: Executor = get_executor(job.executor)
 
+    try:
+        ensure_not_active(db)
+    except EmergencyStopActive:
+        # Never executed, so cancelled is accurate. The stop was activated after admission.
+        _transition(job, JobStatus.cancelled)
+        job.error = "emergency stop: job was not started"
+        job.finished_at = datetime.now(UTC)
+        db.commit()
+        return job
     _transition(job, JobStatus.running)
     job.started_at = datetime.now(UTC)
-    db.flush()
+    db.commit()  # release the start lock before execution
 
     try:
         data = storage.load(sample.sha256)
@@ -124,7 +136,7 @@ def run_job(db: Session, job: AnalysisJob, *, timeout_seconds: int = 60) -> Anal
         _transition(job, JobStatus.failed)
         job.error = "sample data unavailable"
         job.finished_at = datetime.now(UTC)
-        db.flush()
+        db.commit()  # persist the terminal state before the caller can roll back
         return job
 
     request = ExecutionRequest(
@@ -146,13 +158,13 @@ def run_job(db: Session, job: AnalysisJob, *, timeout_seconds: int = 60) -> Anal
         _transition(job, JobStatus.timed_out)
         job.error = "execution exceeded timeout"
         job.finished_at = datetime.now(UTC)
-        db.flush()
+        db.commit()  # persist the terminal state before the caller can roll back
         return job
     except Exception as exc:  # executor raised
         _transition(job, JobStatus.failed)
         job.error = str(exc)
         job.finished_at = datetime.now(UTC)
-        db.flush()
+        db.commit()  # persist the terminal state before the caller can roll back
         return job
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
@@ -177,5 +189,5 @@ def run_job(db: Session, job: AnalysisJob, *, timeout_seconds: int = 60) -> Anal
             sample_sha256=sample.sha256,
             events=events,
         )
-        db.flush()
+        db.commit()  # persist the terminal state before the caller can roll back
     return job
