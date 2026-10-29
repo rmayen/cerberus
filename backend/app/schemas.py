@@ -225,4 +225,5 @@ class DifferentialRead(BaseModel):
     created_by: int | None
     created_at: datetime
     finished_at: datetime | None
+    error_message: str | None = None
     findings: list[DifferentialFindingRead]

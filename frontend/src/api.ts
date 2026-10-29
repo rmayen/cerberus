@@ -285,5 +285,6 @@ export interface Differential {
   created_by: number | null;
   created_at: string;
   finished_at: string | null;
+  error_message: string | null;
   findings: DifferentialFinding[];
 }
