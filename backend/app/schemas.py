@@ -227,3 +227,11 @@ class DifferentialRead(BaseModel):
     finished_at: datetime | None
     error_message: str | None = None
     findings: list[DifferentialFindingRead]
+
+
+class EmergencyStopRead(BaseModel):
+    active: bool
+
+
+class EmergencyStopUpdate(BaseModel):
+    active: bool

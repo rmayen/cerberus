@@ -7,6 +7,7 @@ from app.models import Role, User
 from app.schemas import DifferentialCreate, DifferentialRead
 from app.services import audit, differential_service
 from app.services.differential_service import UnknownSample
+from app.services.emergency_service import EmergencyStopActive
 
 router = APIRouter(prefix="/api/v1/differential", tags=["differential"])
 
@@ -30,6 +31,12 @@ def run_differential(
         )
     except UnknownSample as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "sample not found") from exc
+    except EmergencyStopActive as exc:
+        db.rollback()  # drop this request's uncommitted baseline job and analysis row
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "emergency stop is active; new analysis is disabled",
+        ) from exc
 
     audit.record(
         db,
