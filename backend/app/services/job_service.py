@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import UTC, datetime
 from typing import Any
 
+from cryptography.fernet import InvalidToken
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -116,9 +117,19 @@ def run_job(db: Session, job: AnalysisJob, *, timeout_seconds: int = 60) -> Anal
     job.started_at = datetime.now(UTC)
     db.flush()
 
+    try:
+        data = storage.load(sample.sha256)
+    except (OSError, InvalidToken):
+        # Fixed message: OSError text contains the blob path, which must not reach clients.
+        _transition(job, JobStatus.failed)
+        job.error = "sample data unavailable"
+        job.finished_at = datetime.now(UTC)
+        db.flush()
+        return job
+
     request = ExecutionRequest(
         sample_sha256=sample.sha256,
-        data=storage.load(sample.sha256),
+        data=data,
         conditions=job.conditions,
         timeout_seconds=timeout_seconds,
     )
