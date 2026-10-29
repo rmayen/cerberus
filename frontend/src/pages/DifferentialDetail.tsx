@@ -8,6 +8,7 @@ import {
   ErrorState,
   JobStatusBadge,
   LoadingBlock,
+  Notice,
   Panel,
 } from "../components/ui/primitives";
 import { CONFIDENCE_ORDER } from "../lib/status";
@@ -88,6 +89,12 @@ export function DifferentialDetail() {
         <Link to={`/samples/${d.sample_id}?tab=differential`}>Differential runs for this sample</Link>
         <Link to={`/samples/${d.sample_id}?tab=findings`}>Findings for this sample</Link>
       </nav>
+
+      {d.status === "failed" && (
+        <Panel title="Analysis failed">
+          <Notice tone="err">{d.error_message ?? "The analysis did not complete."}</Notice>
+        </Panel>
+      )}
 
       {d.findings.length === 0 ? (
         <Panel>

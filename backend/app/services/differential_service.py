@@ -50,6 +50,24 @@ def _run_variant(
     return job
 
 
+def _job_unsuccessful(
+    db: Session, analysis: DifferentialAnalysis, job: AnalysisJob, label: str
+) -> bool:
+    """Fail the analysis if a run did not complete. The job record itself is kept unchanged.
+
+    The stored message is fixed text built from the run label and outcome. It never includes
+    job.error, which can contain internal paths.
+    """
+    if job.status == JobStatus.completed:
+        return False
+    verb = "timed out" if job.status == JobStatus.timed_out else "failed"
+    analysis.status = JobStatus.failed
+    analysis.error_message = f"{label} run {verb}. The other runs were not compared."
+    analysis.finished_at = datetime.now(UTC)
+    db.flush()
+    return True
+
+
 def run_differential(
     db: Session,
     *,
@@ -75,14 +93,22 @@ def run_differential(
     db.add(analysis)
     db.flush()
 
+    # Run every job before comparing anything. If any job did not complete, the analysis fails and
+    # no comparison or finding is produced from partial results.
     baseline_job = _run_variant(db, analysis, baseline_conditions, submitted_by, timeout_seconds)
+    if _job_unsuccessful(db, analysis, baseline_job, "Baseline"):
+        return analysis
     baseline_events = telemetry_service.list_events(db, baseline_job.id)
 
+    runs: list[tuple[dict[str, Any], list[Any]]] = []
     for variation in variations:
         variant_conditions = {**baseline_conditions, **variation}
         variant_job = _run_variant(db, analysis, variant_conditions, submitted_by, timeout_seconds)
-        variant_events = telemetry_service.list_events(db, variant_job.id)
+        if _job_unsuccessful(db, analysis, variant_job, "Variant"):
+            return analysis
+        runs.append((variation, telemetry_service.list_events(db, variant_job.id)))
 
+    for variation, variant_events in runs:
         for axis, variant_value in variation.items():
             result = compare(
                 axis,
