@@ -1,0 +1,37 @@
+[project]
+name = "cerberus"
+version = "0.1.0"
+description = "Defensive malware analysis sandbox for authorized laboratory environments"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+# Add the project root to sys.path so `pytest` (run directly, as in CI) can import `app`.
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["migrations"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# conftest sets the test-only JWT secret before importing the app, so its imports follow code.
+"tests/conftest.py" = ["E402"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI uses these callables in argument defaults by design.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Security",
+    "fastapi.File",
+    "fastapi.Form",
+    "app.deps.require_role",
+]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_ignores = true

@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: cerberus
+      POSTGRES_PASSWORD: cerberus
+      POSTGRES_DB: cerberus
+    volumes:
+      - cerberus-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cerberus"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ./backend
+    environment:
+      CERBERUS_DATABASE_URL: postgresql+psycopg://cerberus:cerberus@db:5432/cerberus
+      CERBERUS_JWT_SECRET: ${CERBERUS_JWT_SECRET:?Set CERBERUS_JWT_SECRET in the environment or a .env file}
+      CERBERUS_STORAGE_KEY: ${CERBERUS_STORAGE_KEY:?Set CERBERUS_STORAGE_KEY in the environment or a .env file}
+      CERBERUS_ENVIRONMENT: development
+      CERBERUS_ADMIN_USERNAME: admin
+      # Required on the first start only (creates the admin). Later starts ignore it.
+      CERBERUS_ADMIN_PASSWORD: ${CERBERUS_ADMIN_PASSWORD:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    command: >
+      sh -c "alembic upgrade head &&
+             python -m app.bootstrap &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+volumes:
+  cerberus-db:
