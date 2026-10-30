@@ -10,7 +10,10 @@ Tests use this to register harmless fixture executors. Production refuses to sta
 
 import importlib
 import json
+import os
 import sys
+import threading
+import time
 from typing import Any
 
 from app.config import settings
@@ -20,6 +23,20 @@ from app.executors.registry import UnknownExecutor, get_executor
 EXIT_OK = 0
 EXIT_EXECUTOR_RAISED = 3
 EXIT_INVALID_REQUEST = 4
+EXIT_ORPHANED = 5
+ORPHAN_POLL_SECONDS = 1.0
+
+
+def _exit_when_orphaned(parent_pid: int) -> None:
+    """POSIX: when the worker dies, this child is re-parented. Stop rather than run unowned.
+
+    Only the child's own run is stopped. Nothing is recorded, because the worker that would have
+    recorded it is gone. Recovery marks the job failed when its lease expires.
+    """
+    while True:
+        time.sleep(ORPHAN_POLL_SECONDS)
+        if os.getppid() != parent_pid:
+            os._exit(EXIT_ORPHANED)
 
 
 def main() -> int:
@@ -27,6 +44,9 @@ def main() -> int:
         importlib.import_module(module)
     try:
         request: dict[str, Any] = json.load(sys.stdin)
+        # The worker's pid comes in the request. Comparing against it is what catches a worker
+        # that died before this child started: the child is then already re-parented.
+        parent_pid = int(request["parent_pid"])
         executor = get_executor(str(request["executor"]))
         execution = ExecutionRequest(
             sample_sha256=str(request["sample_sha256"]),
@@ -36,6 +56,10 @@ def main() -> int:
         )
     except (KeyError, TypeError, ValueError, UnknownExecutor):
         return EXIT_INVALID_REQUEST
+    if os.name == "posix":
+        if os.getppid() != parent_pid:
+            return EXIT_ORPHANED  # the worker is already gone; do not start unowned work
+        threading.Thread(target=_exit_when_orphaned, args=(parent_pid,), daemon=True).start()
     try:
         result = executor.run(execution)
     except Exception:

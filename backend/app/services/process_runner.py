@@ -73,6 +73,7 @@ def run_in_child(
             "sample_sha256": sample_sha256,
             "conditions": conditions,
             "timeout_seconds": timeout_seconds,
+            "parent_pid": os.getpid(),  # the child stops itself if this process dies
         }
     ).encode()
     # Temporary files, not pipes, so a large result cannot block the child while we wait on it.

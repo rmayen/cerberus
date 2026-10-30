@@ -130,6 +130,37 @@ and does not execute anything. A separate worker process runs queued jobs.
 
   Run one or more workers. Each claims one pending job at a time with
   `SELECT ... FOR UPDATE SKIP LOCKED`, so no job runs twice concurrently.
+- **Supervised start (recommended).** `python -m app.supervisor` runs the worker,
+  restarts it after an unexpected exit (backoff 1, 2, 4 ... up to 30 seconds), and
+  stops restarting after 5 unexpected exits within 5 minutes. It never claims or
+  executes jobs itself. Restarts pass through the same claim path, so an active
+  emergency stop still blocks new work.
+- **Stopping.** Send SIGTERM (or SIGINT, or Ctrl-C) to the worker or the supervisor.
+  The worker stops claiming. A running job may finish for up to 15 seconds. After
+  that its child is terminated, and the job is recorded `cancelled` only once the
+  child is confirmed gone. The supervisor waits 30 seconds for the worker before
+  killing it. A killed worker leaves its child to stop itself (see below).
+- **Health check.** The worker writes `worker-status.json` in its working
+  directory (override with `CERBERUS_WORKER_STATUS_FILE`). It contains only the
+  state (`ready` or `stopping`), the process id, and a timestamp. `python -m
+  app.worker --check` exits 0 while the state is `ready` and the process exists.
+  The file is written after the database answers at startup. The check does not
+  prove the loop is making progress: a worker can be alive while a long job runs.
+- **Crash recovery.** A worker that dies leaves its job's lease to expire. The next
+  worker to run recovers it as `failed` with `worker lease expired; outcome unknown,
+  not re-executed`. Recovery never runs the job again. Queued jobs stay queued and
+  are claimed normally after restart. A job whose executor this worker does not
+  have is recorded `failed` (`executor is not available`); the worker keeps running.
+- **Orphaned children (POSIX).** A child checks each second that its worker still
+  exists. If the worker was killed, the child exits without recording anything.
+  The worker's pid is part of the request, so a child that starts after its worker
+  died also exits at once.
+- **Operational limits.** The supervisor and worker are not a service manager:
+  nothing restarts the supervisor itself. Use systemd, launchd, or a container
+  runtime for that. A worker killed with SIGKILL may leave a running child for up to
+  one second before the child notices. The status file is not a liveness proof, and
+  on Windows the process check is skipped. Run supervised workers only against
+  PostgreSQL.
 - **Execution in a child process.** Each job runs in its own Python child
   process (`python -m app.executors.child`), not in a worker thread. On POSIX the
   child leads its own process group, so the worker can signal every process it

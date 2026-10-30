@@ -19,6 +19,7 @@ claims. A job is recorded cancelled or timed out only after its child process is
 
 import logging
 import threading
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -37,6 +38,9 @@ from app.services.job_service import _transition, run_job
 RECOVERY_MESSAGE = "worker lease expired; outcome unknown, not re-executed"
 LEASE_DURATION = timedelta(seconds=30)
 HEARTBEAT_INTERVAL = timedelta(seconds=2)
+# After a shutdown request, a running job may finish for this long. Then its child is terminated.
+SHUTDOWN_GRACE_SECONDS = 15.0
+SHUTDOWN_CANCEL_MESSAGE = "worker shutdown: execution terminated"
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +148,8 @@ class LeaseHeartbeat:
         lease: timedelta = LEASE_DURATION,
         interval: timedelta = HEARTBEAT_INTERVAL,
         cancel: process_runner.CancelSignal | None = None,
+        shutdown: threading.Event | None = None,
+        shutdown_grace: float = SHUTDOWN_GRACE_SECONDS,
     ) -> None:
         self._session_factory = session_factory
         self._job_id = job_id
@@ -151,6 +157,9 @@ class LeaseHeartbeat:
         self._lease = lease
         self._interval = interval.total_seconds()
         self.cancel = cancel or process_runner.CancelSignal()
+        self._shutdown = shutdown
+        self._shutdown_grace = shutdown_grace
+        self._shutdown_seen_at: float | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name=f"heartbeat-{job_id}", daemon=True)
 
@@ -165,6 +174,13 @@ class LeaseHeartbeat:
                 return False
             if emergency_service.is_active(session):
                 self.cancel.set("emergency stop: execution terminated")
+                return False
+        if self._shutdown is not None and self._shutdown.is_set():
+            # The job may finish within the grace period. After it, the child is terminated.
+            if self._shutdown_seen_at is None:
+                self._shutdown_seen_at = time.monotonic()
+            if time.monotonic() - self._shutdown_seen_at >= self._shutdown_grace:
+                self.cancel.set(SHUTDOWN_CANCEL_MESSAGE)
                 return False
         return True
 
@@ -220,12 +236,14 @@ def process_next(
     *,
     owner: str,
     session_factory: Callable[[], Session] | None = None,
+    shutdown: threading.Event | None = None,
 ) -> AnalysisJob | None:
     """Claim one queued job and execute it. Returns the job, or None if none was claimed.
 
     The job runs with its requested timeout. With a session_factory, a heartbeat keeps the lease
     alive for the whole run. Without one, no heartbeat runs and the lease lasts LEASE_DURATION
-    only. The worker entrypoint always passes a factory.
+    only. The worker entrypoint always passes a factory. A shutdown event, once set, lets the
+    running job finish for SHUTDOWN_GRACE_SECONDS before its child is terminated.
     """
     job_id = claim_next(db, owner=owner)
     if job_id is None:
@@ -235,7 +253,7 @@ def process_next(
         return None
     if session_factory is None:
         return run_job(db, job, owner=owner)
-    with LeaseHeartbeat(session_factory, job_id, owner=owner) as heartbeat:
+    with LeaseHeartbeat(session_factory, job_id, owner=owner, shutdown=shutdown) as heartbeat:
         return run_job(db, job, owner=owner, cancel=heartbeat.cancel)
 
 
@@ -244,9 +262,18 @@ def drain(
     *,
     owner: str,
     session_factory: Callable[[], Session] | None = None,
+    shutdown: threading.Event | None = None,
 ) -> int:
-    """Process queued jobs until none can be claimed. Returns how many were processed."""
+    """Process queued jobs until none can be claimed or shutdown is requested.
+
+    Returns how many were processed. Once shutdown is set, no new job is claimed.
+    """
     processed = 0
-    while process_next(db, owner=owner, session_factory=session_factory) is not None:
+    while not (shutdown is not None and shutdown.is_set()):
+        if (
+            process_next(db, owner=owner, session_factory=session_factory, shutdown=shutdown)
+            is None
+        ):
+            break
         processed += 1
     return processed
