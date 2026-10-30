@@ -1,3 +1,5 @@
+import re
+
 from cryptography.fernet import Fernet
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -21,6 +23,9 @@ class ConfigurationError(RuntimeError):
     """
 
 
+EXECUTOR_MODULE_PATTERN = re.compile(r"tests(\.[A-Za-z_][A-Za-z0-9_]*)+")
+
+
 class Settings(BaseSettings):
     """Application configuration, read from CERBERUS_-prefixed environment variables."""
 
@@ -42,6 +47,27 @@ class Settings(BaseSettings):
     storage_key: str = ""
     allowed_file_types: str = "pe,elf,macho,zip,gzip,rar,7z,pdf,ole,script,text,binary"
     environment: str = "development"
+    # Test seam only: modules the executor child imports to register harmless fixture executors.
+    # Refused in production, and only modules inside the tests package are accepted.
+    executor_modules: str = ""
+
+    @model_validator(mode="after")
+    def _check_executor_modules(self) -> "Settings":
+        names = self.executor_module_names
+        if not names:
+            return self
+        if self.is_production:
+            raise ConfigurationError(
+                "CERBERUS_EXECUTOR_MODULES must not be set in production. It loads code into "
+                "executor processes and exists only for the test suite."
+            )
+        for name in names:
+            if not EXECUTOR_MODULE_PATTERN.fullmatch(name):
+                raise ConfigurationError(
+                    "CERBERUS_EXECUTOR_MODULES may only name modules in the tests package, "
+                    "for example tests.executor_fixtures."
+                )
+        return self
 
     @model_validator(mode="after")
     def _check_jwt_secret(self) -> "Settings":
@@ -89,6 +115,10 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment.lower() == "production"
+
+    @property
+    def executor_module_names(self) -> list[str]:
+        return [name.strip() for name in self.executor_modules.split(",") if name.strip()]
 
 
 settings = Settings()

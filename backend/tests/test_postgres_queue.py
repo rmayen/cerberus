@@ -11,8 +11,9 @@ from typing import Any
 
 import pytest
 
-from app.models import AnalysisJob, JobStatus
+from app.models import AnalysisJob, JobStatus, Sample
 from app.services import job_service
+from app.services.job_service import request_cancel_running
 from app.services.worker_service import (
     RECOVERY_MESSAGE,
     LeaseHeartbeat,
@@ -113,6 +114,16 @@ def _claimed(make_session: Any, sample_id: int, owner: str, lease: timedelta) ->
         ).id
     with make_session() as s:
         assert claim_next(s, owner=owner, lease=lease) == job_id
+    return job_id
+
+
+def _claimed_in_place(make_session: Any, sample_id: int, executor: str, owner: str) -> int:
+    with make_session() as s:
+        job_id = job_service.create_job(
+            s, sample_id=sample_id, executor_name=executor, conditions={}, submitted_by=None
+        ).id
+    with make_session() as s:
+        assert claim_next(s, owner=owner, lease=timedelta(seconds=90)) == job_id
     return job_id
 
 
@@ -247,3 +258,69 @@ def test_renewal_and_recovery_racing_on_the_same_expiring_lease(
                 assert recover_expired_leases(s, now=datetime.now(UTC) + timedelta(seconds=5)) == 1
 
     assert errors == []
+
+
+def _stored_sample(make_session: Any, sha: str) -> int:
+    """A sample whose bytes exist in storage, so run_job's readability check passes."""
+    data = b"MZ-" + sha.encode()
+    stored_path = job_service.storage.store(sha, data)
+    with make_session() as s:
+        row = Sample(
+            sha256=sha,
+            filename="s.bin",
+            size_bytes=len(data),
+            detected_type="pe",
+            stored_path=stored_path,
+        )
+        s.add(row)
+        s.commit()
+        return row.id
+
+
+def _run_with_heartbeat(make_session: Any, job_id: int, owner: str) -> None:
+    with make_session() as s:
+        job = s.get(AnalysisJob, job_id)
+        with LeaseHeartbeat(
+            make_session, job_id, owner=owner, interval=timedelta(milliseconds=20)
+        ) as heartbeat:
+            job_service.run_job(s, job, owner=owner, cancel=heartbeat.cancel)
+
+
+def test_cancel_request_stops_the_running_child_and_records_cancelled(
+    pg_engine: Any, make_session: Any
+) -> None:
+    sample_id = _stored_sample(make_session, "7" * 64)
+    job_id = _claimed_in_place(make_session, sample_id, "hanging", owner="w1")
+    worker = threading.Thread(target=_run_with_heartbeat, args=(make_session, job_id, "w1"))
+    worker.start()
+    time.sleep(0.5)  # let the child start and block
+    with make_session() as s:
+        _, outcome = request_cancel_running(s, job_id)
+    assert outcome == "requested"
+    worker.join(30)
+
+    assert not worker.is_alive()
+    status, _, error = _status(make_session, job_id)
+    assert status == JobStatus.cancelled
+    assert error == "cancelled while running"
+
+
+def test_cancel_request_racing_completion_never_leaves_a_misleading_state(
+    pg_engine: Any, make_session: Any
+) -> None:
+    sample_id = _stored_sample(make_session, "8" * 64)
+    for round_number in range(6):
+        job_id = _claimed_in_place(make_session, sample_id, "simulated", owner="w1")
+        worker = threading.Thread(target=_run_with_heartbeat, args=(make_session, job_id, "w1"))
+        worker.start()
+        time.sleep(0.02 * round_number)  # vary how far the run has got when cancel lands
+        with make_session() as s:
+            request_cancel_running(s, job_id)
+        worker.join(30)
+
+        status, _, error = _status(make_session, job_id)
+        assert status in (JobStatus.completed, JobStatus.cancelled), round_number
+        if status == JobStatus.completed:
+            assert error is None  # finished first: reported as completed, never as cancelled
+        else:
+            assert error == "cancelled while running"

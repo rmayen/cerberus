@@ -1,7 +1,5 @@
 import io
-import threading
 import time
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -13,8 +11,6 @@ from sqlalchemy.orm import Session, sessionmaker
 from app import worker
 from app.config import ConfigurationError
 from app.database import Base
-from app.executors import registry
-from app.executors.base import ExecutionRequest, ExecutionResult
 from app.models import AnalysisJob, JobStatus, Sample
 from app.services import emergency_service, job_service
 from app.services.worker_service import (
@@ -179,41 +175,21 @@ def test_other_analyst_cannot_cancel_and_admin_can(
     assert allowed.json()["status"] == "cancelled"
 
 
-def test_running_job_cannot_be_cancelled(
+def test_running_job_gets_a_stop_request(
     client: TestClient, people: dict[str, dict[str, str]], db_session: Session, sample_id: int
 ) -> None:
     job_id = _api_job(client, people["a"], sample_id)
     claim_next(db_session, owner="w1", lease=timedelta(seconds=90))
     response = client.post(f"/api/v1/jobs/{job_id}/cancel", headers=people["a"])
-    assert response.status_code == 409
+    assert response.status_code == 202  # stop requested; the job stays running until confirmed
     job = db_session.get(AnalysisJob, job_id)
     assert job is not None
     assert job.status == JobStatus.running
+    assert job.cancel_requested is True
 
 
 def test_cancel_unknown_job_is_404(client: TestClient, people: dict[str, dict[str, str]]) -> None:
     assert client.post("/api/v1/jobs/999999/cancel", headers=people["a"]).status_code == 404
-
-
-class _HangingExecutor:
-    """Harmless test executor that blocks until released. It never touches sample bytes."""
-
-    name = "hanging"
-
-    def __init__(self) -> None:
-        self.release = threading.Event()
-
-    def run(self, request: ExecutionRequest) -> ExecutionResult:
-        self.release.wait(10)
-        return ExecutionResult(status="completed", duration_ms=0, observations={})
-
-
-@pytest.fixture()
-def hanging(monkeypatch: pytest.MonkeyPatch) -> Iterator[_HangingExecutor]:
-    executor = _HangingExecutor()
-    monkeypatch.setitem(registry._EXECUTORS, executor.name, executor)
-    yield executor
-    executor.release.set()
 
 
 def test_requested_timeout_is_validated_and_returned(
@@ -242,7 +218,7 @@ def test_requested_timeout_is_validated_and_returned(
 
 
 def test_worker_enforces_the_requested_timeout(
-    client: TestClient, people: dict[str, dict[str, str]], hanging: _HangingExecutor
+    client: TestClient, people: dict[str, dict[str, str]]
 ) -> None:
     sample_id = client.post(
         "/api/v1/samples",

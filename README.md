@@ -130,16 +130,37 @@ and does not execute anything. A separate worker process runs queued jobs.
 
   Run one or more workers. Each claims one pending job at a time with
   `SELECT ... FOR UPDATE SKIP LOCKED`, so no job runs twice concurrently.
-- **Timeouts.** `timeout_seconds` (1–3600, default 60) is stored with the job
-  and enforced by the worker. An execution that exceeds it is marked `timed_out`.
-  Python cannot stop the executing thread, so its result is discarded and the
-  thread may run on in the background.
+- **Execution in a child process.** Each job runs in its own Python child
+  process (`python -m app.executors.child`), not in a worker thread. On POSIX the
+  child leads its own process group, so the worker can signal every process it
+  started. A child is not a security sandbox: it runs as the same user with the
+  same filesystem access.
+- **Timeouts.** `timeout_seconds` (1–3600, default 60) is stored with the job.
+  When it expires the worker sends SIGTERM to the process group, waits up to
+  5 seconds, then sends SIGKILL. The job is recorded `timed_out` only after the
+  group is confirmed gone.
+- **Cancellation of a running job.** `POST /api/v1/jobs/{id}/cancel` on a running
+  job returns `202` and sets a stop request. The worker's heartbeat sees it
+  within about 2 seconds and terminates the child with the same SIGTERM, grace,
+  SIGKILL sequence. The job becomes `cancelled` only after termination is
+  verified. If the job finishes first, it stays `completed`.
+- **Emergency stop.** Activating the stop blocks new claims. Running children are
+  terminated by the next heartbeat (about 2 seconds), and recorded `cancelled`
+  only after verified termination.
 - **Leases and recovery.** A claimed job holds a 30-second lease. A heartbeat
-  renews it every 10 seconds while the job runs. If a worker stops renewing it
+  renews it every 2 seconds while the job runs. If a worker stops renewing it
   for longer than the lease (crash, hang, or lost database connection), the next
   worker loop marks the job `failed` with the message
   `worker lease expired; outcome unknown, not re-executed`. Jobs are never
-  re-run automatically. A worker whose lease has expired cannot record a result.
+  re-run automatically. A worker whose lease has expired cannot record a result,
+  and a worker that loses its lease terminates its child.
+- **Platform limits.** On Windows there is no grace period: the child is
+  terminated immediately, only that process is confirmed exited, and grandchildren
+  are neither stopped nor detected. On POSIX the group leader stays unreaped while
+  its group is signalled, which keeps its pid from being reused during the sweep.
+  A group that survives SIGKILL and is reaped afterwards can still be affected by
+  a reused pid in a narrow window. `CERBERUS_EXECUTOR_MODULES` is refused at
+  startup in production, and only `tests.*` modules are accepted anywhere.
 - **Differential analyses** are queued the same way. `POST /api/v1/differential`
   queues the baseline and one job per variation, and returns `pending`. Workers
   run those jobs, then finalize the analysis once every job is terminal. Findings

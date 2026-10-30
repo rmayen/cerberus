@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -172,6 +173,10 @@ class AnalysisJob(Base):
     lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+    # Set by a cancel request on a running job. The worker's heartbeat sees it and stops the child.
+    cancel_requested: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
     )
     # Set on jobs that belong to a differential analysis: "baseline", or "variant" with the
     # variation it applies. The analysis compares variant results against the baseline.

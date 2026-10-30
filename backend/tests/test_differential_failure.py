@@ -1,39 +1,14 @@
 import io
-import threading
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.executors import registry
-from app.executors.base import ExecutionRequest, ExecutionResult
-from app.executors.simulated import SimulatedExecutor
 from app.models import AnalysisJob, DifferentialAnalysis, DifferentialFinding, JobStatus, Sample
 from app.services import differential_service, job_service
 from app.services.worker_service import drain
 from tests.conftest import auth_header, run_queued
-
-
-class ScriptedExecutor:
-    """Harmless test executor. Behaviour comes from the run's conditions, not from any sample."""
-
-    name = "scripted"
-
-    def __init__(self) -> None:
-        self.release = threading.Event()
-        self._simulated = SimulatedExecutor()
-
-    def run(self, request: ExecutionRequest) -> ExecutionResult:
-        mode = request.conditions.get("mode")
-        if mode == "fail":
-            return ExecutionResult(
-                status="failed", duration_ms=0, observations={}, error="scripted failure"
-            )
-        if mode == "hang":
-            self.release.wait(10)
-            return ExecutionResult(status="completed", duration_ms=0, observations={})
-        return self._simulated.run(request)
 
 
 @pytest.fixture()
@@ -48,12 +23,9 @@ def analyst_headers(client: TestClient, admin: dict[str, str]) -> dict[str, str]
 
 
 @pytest.fixture()
-def scripted(monkeypatch: pytest.MonkeyPatch) -> ScriptedExecutor:
-    executor = ScriptedExecutor()
-    monkeypatch.setitem(registry._EXECUTORS, executor.name, executor)
+def scripted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The "scripted" executor lives in tests/executor_fixtures.py and runs in the child process."""
     monkeypatch.setattr(job_service.storage, "load", lambda sha: b"MZ")
-    yield executor
-    executor.release.set()
 
 
 def _sample(db: Session, sha: str) -> int:
@@ -110,7 +82,7 @@ def _jobs(db: Session, analysis_id: int) -> list[AnalysisJob]:
 
 
 def test_failed_baseline_fails_analysis_without_findings(
-    db_session: Session, scripted: ScriptedExecutor
+    db_session: Session, scripted: None
 ) -> None:
     analysis = _run(
         db_session, _sample(db_session, "a" * 64), {"mode": "fail"}, [{"internet": False}]
@@ -127,7 +99,7 @@ def test_failed_baseline_fails_analysis_without_findings(
 
 
 def test_failed_variant_fails_analysis_and_keeps_job_records(
-    db_session: Session, scripted: ScriptedExecutor
+    db_session: Session, scripted: None
 ) -> None:
     analysis = _run(
         db_session,
@@ -142,7 +114,7 @@ def test_failed_variant_fails_analysis_and_keeps_job_records(
     assert statuses == [JobStatus.completed, JobStatus.completed, JobStatus.failed]
 
 
-def test_timed_out_variant_fails_analysis(db_session: Session, scripted: ScriptedExecutor) -> None:
+def test_timed_out_variant_fails_analysis(db_session: Session, scripted: None) -> None:
     analysis = _run(
         db_session,
         _sample(db_session, "c" * 64),
@@ -156,9 +128,7 @@ def test_timed_out_variant_fails_analysis(db_session: Session, scripted: Scripte
     assert _jobs(db_session, analysis.id)[-1].status == JobStatus.timed_out
 
 
-def test_successful_comparison_completes_with_findings(
-    db_session: Session, scripted: ScriptedExecutor
-) -> None:
+def test_successful_comparison_completes_with_findings(db_session: Session, scripted: None) -> None:
     analysis = _run(
         db_session, _sample(db_session, "d" * 64), {"internet": True}, [{"internet": False}]
     )
@@ -169,7 +139,7 @@ def test_successful_comparison_completes_with_findings(
 
 
 def test_failed_differential_is_persisted_through_api(
-    client: TestClient, analyst_headers: dict[str, str], scripted: ScriptedExecutor
+    client: TestClient, analyst_headers: dict[str, str], scripted: None
 ) -> None:
     sample_id = client.post(
         "/api/v1/samples",
@@ -204,9 +174,7 @@ def test_failed_differential_is_persisted_through_api(
     )
 
 
-def test_failure_message_is_fixed_and_hides_job_error(
-    db_session: Session, scripted: ScriptedExecutor
-) -> None:
+def test_failure_message_is_fixed_and_hides_job_error(db_session: Session, scripted: None) -> None:
     analysis = _run(
         db_session, _sample(db_session, "g" * 64), {"mode": "fail"}, [{"internet": False}]
     )
@@ -216,7 +184,7 @@ def test_failure_message_is_fixed_and_hides_job_error(
     assert "/" not in analysis.error_message
 
 
-def test_timeout_message_names_the_run(db_session: Session, scripted: ScriptedExecutor) -> None:
+def test_timeout_message_names_the_run(db_session: Session, scripted: None) -> None:
     analysis = _run(
         db_session,
         _sample(db_session, "h" * 64),
@@ -228,9 +196,7 @@ def test_timeout_message_names_the_run(db_session: Session, scripted: ScriptedEx
     assert analysis.error_message == "Variant run timed out. The other runs were not compared."
 
 
-def test_successful_analysis_has_no_error_message(
-    db_session: Session, scripted: ScriptedExecutor
-) -> None:
+def test_successful_analysis_has_no_error_message(db_session: Session, scripted: None) -> None:
     analysis = _run(
         db_session, _sample(db_session, "i" * 64), {"internet": True}, [{"internet": False}]
     )

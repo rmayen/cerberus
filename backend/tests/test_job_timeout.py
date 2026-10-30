@@ -1,79 +1,70 @@
-import threading
+"""Timeouts enforce process termination: the child is stopped and gone before a job is recorded."""
+
+import os
 import time
 
 import pytest
 from sqlalchemy.orm import Session
 
-from app.executors import registry
-from app.executors.base import ExecutionRequest, ExecutionResult
 from app.models import AnalysisJob, JobStatus, Sample
-from app.services import job_service
-
-
-class GatedExecutor:
-    """A harmless simulated executor that blocks until the test releases it."""
-
-    name = "gated"
-
-    def __init__(self) -> None:
-        self.release = threading.Event()
-
-    def run(self, request: ExecutionRequest) -> ExecutionResult:
-        self.release.wait(10)
-        return ExecutionResult(status="completed", duration_ms=0, observations={})
+from app.services import job_service, process_runner
 
 
 @pytest.fixture()
-def gated(monkeypatch: pytest.MonkeyPatch) -> GatedExecutor:
-    executor = GatedExecutor()
-    monkeypatch.setitem(registry._EXECUTORS, executor.name, executor)
+def storage_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(job_service.storage, "load", lambda sha: b"MZ")
-    yield executor
-    executor.release.set()  # let any abandoned worker thread finish during teardown
 
 
-def _job(db: Session, sha: str) -> AnalysisJob:
+def _job(db: Session, sha: str, executor: str) -> AnalysisJob:
     sample = Sample(
-        sha256=sha,
-        filename="s.bin",
-        size_bytes=2,
-        detected_type="pe",
-        stored_path="unused",
+        sha256=sha, filename="s.bin", size_bytes=2, detected_type="pe", stored_path="unused"
     )
     db.add(sample)
     db.flush()
-    job = AnalysisJob(sample_id=sample.id, executor="gated", conditions={})
+    job = AnalysisJob(sample_id=sample.id, executor=executor, conditions={})
     db.add(job)
     db.flush()
     return job
 
 
-def test_timeout_returns_without_waiting_for_the_executor(
-    db_session: Session, gated: GatedExecutor
+def test_timeout_stops_the_child_and_records_timed_out(
+    db_session: Session, storage_ok: None
 ) -> None:
-    job = _job(db_session, "d" * 64)
+    job = _job(db_session, "d" * 64, "hanging")  # sleeps far past the 1-second limit
 
     started = time.monotonic()
     job_service.run_job(db_session, job, timeout_seconds=1)
     elapsed = time.monotonic() - started
 
-    # The executor is still blocked here. Waiting for it would take up to 10 seconds.
-    assert elapsed < 5
+    assert elapsed < 10, "the hung child must be terminated, not waited for"
     assert job.status == JobStatus.timed_out
     assert job.error == "execution exceeded timeout"
     assert job.finished_at is not None
 
 
-def test_late_result_cannot_overwrite_timed_out_status(
-    db_session: Session, gated: GatedExecutor
-) -> None:
-    job = _job(db_session, "e" * 64)
-    job_service.run_job(db_session, job, timeout_seconds=1)
+def test_timed_out_child_process_group_is_gone(storage_ok: None) -> None:
+    outcome = process_runner.run_in_child(
+        executor_name="hanging",
+        sample_sha256="e" * 64,
+        conditions={},
+        timeout_seconds=1,
+    )
+    assert outcome.kind == "timed_out"
+    assert outcome.pid is not None
+    if os.name == "posix":
+        with pytest.raises(ProcessLookupError):
+            os.killpg(outcome.pid, 0)  # no member of the child's group remains
 
-    # Let the abandoned executor finish and return a "completed" result.
-    gated.release.set()
-    time.sleep(0.3)
 
-    assert job.status == JobStatus.timed_out
-    assert job.result is None
-    assert job.error == "execution exceeded timeout"
+def test_child_that_ignores_sigterm_is_killed(storage_ok: None) -> None:
+    started = time.monotonic()
+    outcome = process_runner.run_in_child(
+        executor_name="stubborn",
+        sample_sha256="f" * 64,
+        conditions={},
+        timeout_seconds=1,
+    )
+    elapsed = time.monotonic() - started
+
+    assert outcome.kind == "timed_out"  # recorded only after SIGKILL confirmed the group is gone
+    assert elapsed < 1 + process_runner.GRACE_SECONDS + 5

@@ -83,10 +83,13 @@ def get_job(
 def cancel_job(
     job_id: int,
     request: Request,
+    response: Response,
     db: Session = Depends(get_db),
     user: User = Depends(require_role(Role.analyst, Role.administrator)),
 ) -> object:
-    """Cancel a queued job. Idempotent. Running and finished jobs cannot be cancelled."""
+    """Cancel a job. Queued jobs are cancelled at once (200). A running job gets a stop request
+    (202): it stays running until its process is confirmed stopped, then becomes cancelled.
+    Finished jobs return 409. Repeat calls are idempotent."""
     existing = job_service.get_job(db, job_id)
     if existing is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
@@ -104,6 +107,22 @@ def cancel_job(
     job, outcome = job_service.cancel_queued(db, job_id)
     if outcome == "not_found" or job is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    if outcome == "not_cancellable" and job.status == JobStatus.running:
+        job, running_outcome = job_service.request_cancel_running(db, job_id)
+        if job is None or running_outcome == "not_found":
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+        if running_outcome == "requested":
+            audit.record(
+                db,
+                "job_cancel_requested",
+                actor_user_id=user.id,
+                detail=f"stop requested for running job {job.id}",
+                ip=request.client.host if request.client else None,
+            )
+            db.commit()
+        if running_outcome != "not_running":
+            response.status_code = status.HTTP_202_ACCEPTED
+            return job
     if outcome == "not_cancellable":
         raise HTTPException(
             status.HTTP_409_CONFLICT,

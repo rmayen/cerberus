@@ -11,9 +11,6 @@ import time
 import pytest
 from sqlalchemy import text
 
-from app.executors import registry
-from app.executors.base import ExecutionRequest
-from app.executors.simulated import SimulatedExecutor
 from app.models import AnalysisJob, DifferentialAnalysis, DifferentialFinding, JobStatus
 from app.services import differential_service, emergency_service, job_service
 from app.services.emergency_service import EmergencyStopActive
@@ -28,36 +25,18 @@ from tests.test_postgres_emergency_stop import (  # noqa: F401  (fixtures)
 pytestmark = pytest.mark.skipif(not PG_URL, reason="CERBERUS_TEST_POSTGRES_URL not set")
 
 
-class GatedExecutor(SimulatedExecutor):
-    """Harmless simulated executor. Its baseline run blocks until the test releases it."""
-
-    name = "gated"
-
-    def __init__(self) -> None:
-        self.started = threading.Event()
-        self.release = threading.Event()
-        self.calls = 0
-
-    def run(self, request: ExecutionRequest):  # type: ignore[no-untyped-def]
-        self.calls += 1
-        if request.conditions.get("gate") == "baseline":
-            self.started.set()
-            self.release.wait(20)
-        return super().run(request)
-
-
 def test_activation_during_baseline_run_stops_queued_variants_without_blocking(
-    pg_engine, make_session, monkeypatch
+    pg_engine, make_session, monkeypatch, tmp_path
 ) -> None:
     monkeypatch.setattr(job_service.storage, "load", lambda sha: b"MZ")
-    gated = GatedExecutor()
-    monkeypatch.setitem(registry._EXECUTORS, "gated", gated)
+    gate = tmp_path / "gate"  # the child run waits for this file; the test creates it to release
+    log = tmp_path / "runs.log"
     sample_id = _sample(make_session, "c" * 64)
     with make_session() as s:
         analysis_id = differential_service.enqueue(
             s,
             sample_id=sample_id,
-            baseline_conditions={"gate": "baseline"},
+            baseline_conditions={"gate_file": str(gate), "log": str(log)},
             variations=[{"internet": False}],
             executor_name="gated",
             submitted_by=None,
@@ -75,7 +54,11 @@ def test_activation_during_baseline_run_stops_queued_variants_without_blocking(
     thread = threading.Thread(target=worker)
     thread.start()
     try:
-        assert gated.started.wait(10), "baseline run never started"
+        started = gate.with_name("gate.started")
+        deadline = time.monotonic() + 10
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert started.exists(), "baseline run never started"
         # The baseline is executing. Activation must commit now, without waiting for it.
         began = time.monotonic()
         with make_session() as s:
@@ -83,11 +66,11 @@ def test_activation_during_baseline_run_stops_queued_variants_without_blocking(
             s.commit()
         assert time.monotonic() - began < 5, "activation blocked behind a running analysis"
     finally:
-        gated.release.set()
+        gate.touch()
     thread.join(30)
     assert errors == []
 
-    assert gated.calls == 1, "no variant may start after activation"
+    assert log.read_text().count("run") == 1, "no variant may start after activation"
     with make_session() as s:
         jobs = s.query(AnalysisJob).filter_by(differential_id=analysis_id).order_by(AnalysisJob.id)
         assert [j.status for j in jobs] == [JobStatus.completed, JobStatus.pending]
