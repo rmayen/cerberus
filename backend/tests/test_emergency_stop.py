@@ -3,7 +3,7 @@ import io
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.conftest import auth_header
+from tests.conftest import auth_header, run_queued
 
 
 @pytest.fixture()
@@ -107,7 +107,10 @@ def test_clearing_stop_allows_jobs_again(
         headers=roles["analyst"],
     )
     assert response.status_code == 201
-    assert response.json()["status"] == "completed"
+    assert response.json()["status"] == "pending"
+    assert run_queued() == 1
+    fetched = client.get(f"/api/v1/jobs/{response.json()['id']}", headers=roles["viewer"]).json()
+    assert fetched["status"] == "completed"
 
 
 def test_stop_does_not_alter_existing_job_records(
@@ -121,5 +124,6 @@ def test_stop_does_not_alter_existing_job_records(
     ).json()
 
     _set_stop(client, roles["admin"], True)
+    assert run_queued() == 0  # the stop blocks worker starts; queued work is preserved
     fetched = client.get(f"/api/v1/jobs/{created['id']}", headers=roles["viewer"]).json()
-    assert fetched["status"] == created["status"] == "completed"
+    assert fetched["status"] == created["status"] == "pending"

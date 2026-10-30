@@ -8,7 +8,7 @@ from app.executors import registry
 from app.executors.base import ExecutionRequest, ExecutionResult
 from app.models import AnalysisJob, JobStatus, Sample
 from app.services import job_service
-from tests.conftest import auth_header
+from tests.conftest import auth_header, run_queued
 
 
 @pytest.fixture()
@@ -41,7 +41,9 @@ def test_submit_job_runs_to_completion(
         headers=analyst_headers,
     )
     assert response.status_code == 201, response.text
-    body = response.json()
+    assert response.json()["status"] == "pending"  # queued, not executed in the request
+    run_queued()
+    body = client.get(f"/api/v1/jobs/{response.json()['id']}", headers=analyst_headers).json()
     assert body["status"] == "completed"
     assert body["result"]["network"]  # simulated network activity present
     assert body["duration_ms"] is not None

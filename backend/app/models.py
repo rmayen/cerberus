@@ -151,6 +151,10 @@ class AnalysisJob(Base):
     status: Mapped[JobStatus] = mapped_column(
         Enum(JobStatus), default=JobStatus.pending, nullable=False, index=True
     )
+    # Requested execution limit, enforced by the worker and by the inline runner.
+    timeout_seconds: Mapped[int] = mapped_column(
+        Integer, default=60, server_default="60", nullable=False
+    )
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -162,6 +166,13 @@ class AnalysisJob(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Worker lease: set when a worker claims the job and renewed by its heartbeat. A lease that
+    # expires while still running means the outcome is unknown, so recovery marks the job failed
+    # and never re-executes it.
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 

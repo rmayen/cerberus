@@ -47,8 +47,19 @@ def db_session() -> Iterator[Session]:
         Base.metadata.drop_all(engine)
 
 
+def run_queued() -> int:
+    """Process queued jobs in the test database, as the worker process would."""
+    from app.services.worker_service import drain
+
+    queue_session: Session | None = getattr(app.state, "queue_session", None)
+    assert queue_session is not None, "run_queued needs the client fixture"
+    return drain(queue_session, owner="test-worker")
+
+
 @pytest.fixture()
 def client(db_session: Session) -> Iterator[TestClient]:
+    app.state.queue_session = db_session
+
     def override_get_db() -> Iterator[Session]:
         yield db_session
 

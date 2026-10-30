@@ -45,6 +45,7 @@ def _run_variant(
         executor_name=analysis.executor,
         conditions=conditions,
         submitted_by=submitted_by,
+        timeout_seconds=timeout_seconds,
     )
     job.differential_id = analysis.id
     job_service.run_job(db, job, timeout_seconds=timeout_seconds)

@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.telemetry.normalizer import canonicalize, normalize
-from tests.conftest import auth_header
+from tests.conftest import auth_header, run_queued
 
 
 def test_canonicalize_strips_volatile_fields() -> None:
@@ -47,11 +47,13 @@ def _run_job(client: TestClient, headers: dict[str, str], conditions: dict[str, 
         files={"file": ("s.bin", io.BytesIO(b"MZ telemetry"), "application/octet-stream")},
         headers=headers,
     ).json()["sample"]["id"]
-    return client.post(
+    job_id: int = client.post(
         "/api/v1/jobs",
         json={"sample_id": sample_id, "conditions": conditions},
         headers=headers,
     ).json()["id"]
+    run_queued()
+    return job_id
 
 
 def test_running_a_job_produces_telemetry(

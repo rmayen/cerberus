@@ -5,7 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.analysis.attack import map_findings
-from tests.conftest import auth_header
+from tests.conftest import auth_header, run_queued
 
 
 @dataclass
@@ -56,6 +56,7 @@ def test_completed_job_has_attack_mappings(
         json={"sample_id": sample_id, "conditions": {"internet": True}},
         headers=analyst_headers,
     ).json()["id"]
+    run_queued()
 
     response = client.get(f"/api/v1/jobs/{job_id}/attack", headers=analyst_headers)
     assert response.status_code == 200

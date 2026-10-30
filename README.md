@@ -40,6 +40,9 @@ environments only. See [SECURITY](docs/SECURITY.md).
 - **Reports** — HTML and PDF reports with executive summary, timeline, findings,
   IOCs, ATT&CK, and evidence-based containment recommendations.
 - **Dashboard** — a React + TypeScript analyst UI over the whole workflow.
+- **Emergency stop** — an administrator switch that refuses new jobs and
+  differential runs with HTTP 503 and creates no records. Workers claim no new
+  queued jobs while it is active. Running work is not terminated.
 
 ## Technology
 
@@ -93,11 +96,67 @@ the endpoint reference.
 cd backend
 ruff check .        # lint
 mypy app            # type check
-pytest              # tests
+pytest              # tests (PostgreSQL concurrency tests are skipped unless configured)
 
 cd ../frontend
 npm run build       # type-check + bundle
 ```
+
+The PostgreSQL concurrency tests run only against a disposable local database
+named `cerberus_test`. Set `CERBERUS_TEST_POSTGRES_URL` to its URL. They drop and
+recreate the `public` schema, so they refuse any other target:
+
+```bash
+CERBERUS_TEST_POSTGRES_URL=postgresql+psycopg://USER:PASSWORD@localhost:5432/cerberus_test \
+  pytest tests/test_postgres_queue.py tests/test_postgres_emergency_stop.py \
+  tests/test_postgres_differential_stop.py
+```
+
+SQLite has no row locks, so SQLite results are best-effort only. Verify locking
+behavior on PostgreSQL.
+
+## Job queue and worker
+
+`POST /api/v1/jobs` only queues a job: it returns `201` with status `pending`
+and does not execute anything. A separate worker process runs queued jobs.
+
+- **Start a worker** (PostgreSQL required; see the warning below):
+
+  ```bash
+  cd backend
+  CERBERUS_DATABASE_URL=postgresql+psycopg://USER:PASSWORD@localhost:5432/cerberus \
+    python -m app.worker
+  ```
+
+  Run one or more workers. Each claims one pending job at a time with
+  `SELECT ... FOR UPDATE SKIP LOCKED`, so no job runs twice concurrently.
+- **Timeouts.** `timeout_seconds` (1–3600, default 60) is stored with the job
+  and enforced by the worker. An execution that exceeds it is marked `timed_out`.
+  Python cannot stop the executing thread, so its result is discarded and the
+  thread may run on in the background. Differential analyses still execute
+  inside the HTTP request and keep their own timeout.
+- **Leases and recovery.** A claimed job holds a 30-second lease. A heartbeat
+  renews it every 10 seconds while the job runs. If a worker stops renewing it
+  for longer than the lease (crash, hang, or lost database connection), the next
+  worker loop marks the job `failed` with the message
+  `worker lease expired; outcome unknown, not re-executed`. Jobs are never
+  re-run automatically. A worker whose lease has expired cannot record a result.
+- **Cancellation.** `POST /api/v1/jobs/{id}/cancel` by the submitter or an
+  administrator cancels a **pending** job. It is idempotent: cancelling an
+  already cancelled job returns `200`. A running or finished job returns `409`.
+  A running job cannot be cancelled.
+- **Emergency stop.** While it is active, job submission returns `503`, and
+  workers claim no new jobs. Queued jobs stay `pending` and run after the stop is
+  cleared. A stop does not terminate a job that is already running.
+
+**Guarantees apply on PostgreSQL only.** SQLite has no row locks, so claiming,
+cancellation, and emergency-stop checks are not race-safe there. The worker
+refuses to start unless `CERBERUS_DATABASE_URL` is a PostgreSQL URL. The API and
+unit tests still run on SQLite for development.
+
+Not included: worker supervision, automatic restarts, deployment configuration,
+and termination of running work. A downgrade of migration `7c1e4b2d9a80` drops
+the stored timeouts, so requeued jobs then use the 60-second default.
 
 ## Documentation
 

@@ -36,6 +36,7 @@ def submit_job(
             executor_name=body.executor,
             conditions=body.conditions,
             submitted_by=user.id,
+            timeout_seconds=body.timeout_seconds,
         )
     except UnknownSample as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "sample not found") from exc
@@ -45,12 +46,11 @@ def submit_job(
         db.rollback()
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, EMERGENCY_MESSAGE) from exc
 
-    job_service.run_job(db, job, timeout_seconds=body.timeout_seconds)
     audit.record(
         db,
-        "job_run",
+        "job_queued",
         actor_user_id=user.id,
-        detail=f"job {job.id} on sample {job.sample_id}: {job.status}",
+        detail=f"job {job.id} on sample {job.sample_id} queued",
         ip=request.client.host if request.client else None,
     )
     db.commit()
@@ -76,6 +76,42 @@ def get_job(
     job = job_service.get_job(db, job_id)
     if job is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    return job
+
+
+@router.post("/{job_id}/cancel", response_model=JobRead)
+def cancel_job(
+    job_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role(Role.analyst, Role.administrator)),
+) -> object:
+    """Cancel a queued job. Idempotent. Running and finished jobs cannot be cancelled."""
+    existing = job_service.get_job(db, job_id)
+    if existing is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    if user.role != Role.administrator and existing.submitted_by != user.id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "only the submitter or an administrator can cancel"
+        )
+
+    job, outcome = job_service.cancel_queued(db, job_id)
+    if outcome == "not_found" or job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    if outcome == "not_cancellable":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"job is {job.status}; only queued jobs can be cancelled",
+        )
+    if outcome == "cancelled":
+        audit.record(
+            db,
+            "job_cancelled",
+            actor_user_id=user.id,
+            detail=f"job {job.id} cancelled while queued",
+            ip=request.client.host if request.client else None,
+        )
+        db.commit()
     return job
 
 

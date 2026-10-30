@@ -19,8 +19,9 @@
 - **Disposable-VM executor** — a real detonation backend (snapshot restore,
   network isolation, timeout, cleanup) implementing the executor interface, run
   in an isolated lab.
-- **Background worker** — move job execution off the request path onto a queue
-  (e.g. Redis) for long-running real detonations.
+- **Worker hardening** — the PostgreSQL queue, leases, and worker process exist.
+  Still open: supervision and restarts, termination of running work, moving
+  differential runs onto the queue, and a deployment service for the worker.
 - **Richer detection** — YARA matching on carved files, Sigma rule generation
   from observed indicators, and additional behavior analyzers.
 - **Report enhancements** — process-tree visualization and per-tactic ATT&CK
