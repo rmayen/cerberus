@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     # Test seam only: modules the executor child imports to register harmless fixture executors.
     # Refused in production, and only modules inside the tests package are accepted.
     executor_modules: str = ""
+    # Readiness file written by the queue worker: state, pid, and a timestamp. No secrets.
+    worker_status_file: str = "worker-status.json"
 
     @model_validator(mode="after")
     def _check_executor_modules(self) -> "Settings":

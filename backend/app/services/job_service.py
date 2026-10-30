@@ -198,7 +198,14 @@ def run_job(
     sample = db.get(Sample, job.sample_id)
     if sample is None:
         raise UnknownSample()
-    get_executor(job.executor)  # validates the executor name before any work starts
+    try:
+        get_executor(job.executor)  # validates the executor name before any work starts
+    except UnknownExecutor:
+        if owner is None:
+            raise
+        # A worker must not crash on a job it cannot run. Record it failed, and let the next job
+        # run. Otherwise one bad job would crash every worker that claims it.
+        return _settle(db, job, owner, JobStatus.failed, error="executor is not available")
     timeout = job.timeout_seconds if timeout_seconds is None else timeout_seconds
 
     if owner is None:

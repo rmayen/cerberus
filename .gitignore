@@ -15,3 +15,7 @@ dist/
 build/
 .DS_Store
 node_modules/
+
+# Worker readiness file (written at runtime by app.worker)
+worker-status.json
+worker-status.json.tmp
