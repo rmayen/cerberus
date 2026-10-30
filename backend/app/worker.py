@@ -11,6 +11,7 @@ import time
 
 from app.config import ConfigurationError, settings
 from app.database import SessionLocal
+from app.services.differential_service import finalize_ready
 from app.services.worker_service import drain, recover_expired_leases
 
 POLL_SECONDS = 2.0
@@ -32,6 +33,7 @@ def main() -> None:
         with SessionLocal() as db:
             recover_expired_leases(db)
             drain(db, owner=owner, session_factory=SessionLocal)
+            finalize_ready(db)
         time.sleep(POLL_SECONDS)
 
 

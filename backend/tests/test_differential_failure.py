@@ -11,7 +11,8 @@ from app.executors.base import ExecutionRequest, ExecutionResult
 from app.executors.simulated import SimulatedExecutor
 from app.models import AnalysisJob, DifferentialAnalysis, DifferentialFinding, JobStatus, Sample
 from app.services import differential_service, job_service
-from tests.conftest import auth_header
+from app.services.worker_service import drain
+from tests.conftest import auth_header, run_queued
 
 
 class ScriptedExecutor:
@@ -83,7 +84,7 @@ def _run(
     variations: list[dict[str, object]],
     timeout_seconds: int = 5,
 ) -> DifferentialAnalysis:
-    return differential_service.run_differential(
+    analysis = differential_service.enqueue(
         db,
         sample_id=sample_id,
         baseline_conditions=baseline,
@@ -92,6 +93,10 @@ def _run(
         submitted_by=None,
         timeout_seconds=timeout_seconds,
     )
+    drain(db, owner="test-worker")
+    differential_service.finalize_ready(db)
+    db.refresh(analysis)
+    return analysis
 
 
 def _jobs(db: Session, analysis_id: int) -> list[AnalysisJob]:
@@ -114,7 +119,11 @@ def test_failed_baseline_fails_analysis_without_findings(
     assert analysis.status == JobStatus.failed
     assert analysis.finished_at is not None
     assert _findings(db_session, analysis.id) == []
-    assert [job.status for job in _jobs(db_session, analysis.id)] == [JobStatus.failed]
+    # Variants become claimable only after a completed baseline, so this one is cancelled unrun.
+    assert [job.status for job in _jobs(db_session, analysis.id)] == [
+        JobStatus.failed,
+        JobStatus.cancelled,
+    ]
 
 
 def test_failed_variant_fails_analysis_and_keeps_job_records(
@@ -179,7 +188,10 @@ def test_failed_differential_is_persisted_through_api(
         headers=analyst_headers,
     )
     assert response.status_code == 201, response.text
-    body = response.json()
+    assert response.json()["status"] == "pending"  # queued; nothing ran in the request
+    run_queued()
+    analysis_id = response.json()["id"]
+    body = client.get(f"/api/v1/differential/{analysis_id}", headers=analyst_headers).json()
     assert body["status"] == "failed"
     assert body["findings"] == []
     assert body["error_message"] == "Baseline run failed. The other runs were not compared."

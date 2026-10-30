@@ -11,8 +11,9 @@ from sqlalchemy.orm import Session
 from app import models
 from app.config import settings
 from app.database import Base
-from app.services import differential_service, emergency_service, job_service
-from tests.conftest import auth_header
+from app.services import emergency_service
+from app.services.worker_service import process_next
+from tests.conftest import auth_header, run_queued
 from tests.test_emergency_stop import _sample, _set_stop, roles  # noqa: F401  (fixture reuse)
 
 BACKEND = Path(__file__).resolve().parent.parent
@@ -30,62 +31,47 @@ def _post_differential(client: TestClient, headers: dict[str, str], sample_id: i
     )
 
 
-def test_stop_between_admission_and_start_cancels_job_and_fails_analysis(
+def test_stop_after_admission_keeps_queued_runs_pending(
     client: TestClient,
     roles: dict[str, dict[str, str]],  # noqa: F811
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Admission passes. The stop commits before the baseline's start check, so the baseline is
-    # cancelled without executing, and the admitted analysis is recorded as failed.
-    sample_id = _sample(client, roles["analyst"], b"MZ between-admission-and-start")
-    real_check = job_service.ensure_not_active
-    calls = {"n": 0}
+    sample_id = _sample(client, roles["analyst"], b"MZ queued-stop")
+    analysis_id = _post_differential(client, roles["analyst"], sample_id).json()["id"]
+    _set_stop(client, roles["admin"], True)
 
-    def stop_before_start(db: Session) -> None:
-        calls["n"] += 1
-        if calls["n"] == 2:
-            emergency_service.set_active(db, active=True, actor_id=1)
-            db.commit()
-        real_check(db)
+    assert run_queued() == 0  # workers claim nothing while the stop is active
+    body = client.get(f"/api/v1/differential/{analysis_id}", headers=roles["viewer"]).json()
+    assert body["status"] == "pending"
+    assert body["findings"] == []
 
-    monkeypatch.setattr(job_service, "ensure_not_active", stop_before_start)
-    response = _post_differential(client, roles["analyst"], sample_id)
-    monkeypatch.undo()
-
-    assert response.status_code == 201, response.text
-    body = response.json()
-    assert body["status"] == "failed"
-    assert "not started" in body["error_message"]
-    jobs = client.get("/api/v1/jobs", headers=roles["viewer"]).json()
-    assert [job["status"] for job in jobs] == ["cancelled"]
+    _set_stop(client, roles["admin"], False)
+    assert run_queued() == 2
+    body = client.get(f"/api/v1/differential/{analysis_id}", headers=roles["viewer"]).json()
+    assert body["status"] == "completed"
 
 
-def test_stop_before_variant_admission_keeps_completed_baseline(
+def test_stop_between_runs_preserves_completed_baseline(
     client: TestClient,
     roles: dict[str, dict[str, str]],  # noqa: F811
-    monkeypatch: pytest.MonkeyPatch,
+    db_session: Session,
 ) -> None:
-    sample_id = _sample(client, roles["analyst"], b"MZ before-variant")
-    real_run_variant = differential_service._run_variant
-    calls = {"n": 0}
+    sample_id = _sample(client, roles["analyst"], b"MZ between-runs")
+    analysis_id = _post_differential(client, roles["analyst"], sample_id).json()["id"]
 
-    def stop_before_second_run(db, analysis, conditions, submitted_by, timeout_seconds):  # type: ignore[no-untyped-def]
-        calls["n"] += 1
-        if calls["n"] == 2:
-            emergency_service.set_active(db, active=True, actor_id=1)
-            db.commit()
-        return real_run_variant(db, analysis, conditions, submitted_by, timeout_seconds)
+    # Run only the oldest queued job (the baseline), as a worker would before the stop.
+    assert process_next(db_session, owner="test-worker") is not None
+    _set_stop(client, roles["admin"], True)
+    assert run_queued() == 0
 
-    monkeypatch.setattr(differential_service, "_run_variant", stop_before_second_run)
-    response = _post_differential(client, roles["analyst"], sample_id)
-    monkeypatch.undo()
+    jobs = client.get(f"/api/v1/jobs?sample_id={sample_id}", headers=roles["viewer"]).json()
+    assert sorted(job["status"] for job in jobs) == ["completed", "pending"]
+    body = client.get(f"/api/v1/differential/{analysis_id}", headers=roles["viewer"]).json()
+    assert body["status"] == "running"  # one child claimed; the analysis is in progress
 
-    assert response.status_code == 201, response.text
-    body = response.json()
-    assert body["status"] == "failed"
-    assert body["error_message"] == differential_service.EMERGENCY_MID_RUN
-    jobs = client.get("/api/v1/jobs", headers=roles["viewer"]).json()
-    assert [job["status"] for job in jobs] == ["completed"]
+    _set_stop(client, roles["admin"], False)
+    assert run_queued() == 1
+    body = client.get(f"/api/v1/differential/{analysis_id}", headers=roles["viewer"]).json()
+    assert body["status"] == "completed"
 
 
 def test_last_administrator_change_wins(

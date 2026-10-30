@@ -22,12 +22,13 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
+from sqlalchemy.sql import ColumnElement
 
-from app.models import AnalysisJob, JobStatus
+from app.models import AnalysisJob, DifferentialAnalysis, JobStatus
 from app.services.emergency_service import EmergencyStopActive, ensure_not_active
 from app.services.job_service import _transition, run_job
 
@@ -36,6 +37,29 @@ LEASE_DURATION = timedelta(seconds=30)
 HEARTBEAT_INTERVAL = timedelta(seconds=10)
 
 logger = logging.getLogger(__name__)
+
+
+def _eligible() -> ColumnElement[bool]:
+    """A differential variant may run only after its analysis's baseline has completed.
+
+    The check reads committed rows. A baseline that completes commits before any variant can see
+    it, and a failed baseline keeps its variants unclaimable until finalization cancels them.
+    """
+    baseline = aliased(AnalysisJob)
+    completed_baseline = (
+        select(baseline.id)
+        .where(
+            baseline.differential_id == AnalysisJob.differential_id,
+            baseline.differential_role == "baseline",
+            baseline.status == JobStatus.completed,
+        )
+        .exists()
+    )
+    return or_(
+        AnalysisJob.differential_role.is_(None),
+        AnalysisJob.differential_role == "baseline",
+        completed_baseline,
+    )
 
 
 def claim_next(db: Session, *, owner: str, lease: timedelta = LEASE_DURATION) -> int | None:
@@ -50,7 +74,7 @@ def claim_next(db: Session, *, owner: str, lease: timedelta = LEASE_DURATION) ->
         return None
     job = db.execute(
         select(AnalysisJob)
-        .where(AnalysisJob.status == JobStatus.pending)
+        .where(AnalysisJob.status == JobStatus.pending, _eligible())
         .order_by(AnalysisJob.id)
         .limit(1)
         .with_for_update(skip_locked=True)
@@ -63,6 +87,11 @@ def claim_next(db: Session, *, owner: str, lease: timedelta = LEASE_DURATION) ->
     job.started_at = now
     job.lease_owner = owner
     job.lease_expires_at = now + lease
+    if job.differential_id is not None:
+        # Lock order matches differential cancel: the child is already locked, then the analysis.
+        analysis = db.get(DifferentialAnalysis, job.differential_id, with_for_update=True)
+        if analysis is not None and analysis.status == JobStatus.pending:
+            analysis.status = JobStatus.running
     db.commit()
     return job.id
 

@@ -95,6 +95,12 @@ def cancel_job(
             status.HTTP_403_FORBIDDEN, "only the submitter or an administrator can cancel"
         )
 
+    if existing.differential_id is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"job belongs to differential analysis {existing.differential_id}; "
+            "cancel the analysis instead",
+        )
     job, outcome = job_service.cancel_queued(db, job_id)
     if outcome == "not_found" or job is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")

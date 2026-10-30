@@ -60,13 +60,16 @@ token to obtain new ones.
 
 | Method | Path | Role | Description |
 | ------ | ---- | ---- | ----------- |
-| POST | `/differential` | analyst+ | Run baseline + variants; compare behavior |
+| POST | `/differential` | analyst+ | Queue a baseline + variant analysis. Returns `pending`; workers run it |
 | GET | `/differential` | viewer+ | List analyses |
 | GET | `/differential/{id}` | viewer+ | Analysis with confidence-scored dependencies |
+| POST | `/differential/{id}/cancel` | analyst+ (submitter or admin) | Cancel while all runs are still queued. `409` otherwise |
 
 A differential request supplies `baseline_conditions` and a list of `variations`,
 each changing one condition (e.g. `{"internet": false}`); the response lists
-observed behavioral dependencies with `high`/`medium`/`low` confidence.
+observed behavioral dependencies with `high`/`medium`/`low` confidence. Findings
+appear only after every run completes; a failed, timed-out, or cancelled run
+fails the analysis with no findings.
 
 ## Health
 

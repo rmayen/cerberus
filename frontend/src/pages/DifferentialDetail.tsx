@@ -1,4 +1,5 @@
 import { ArrowLeft, GitCompare } from "lucide-react";
+import { useEffect } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, type Differential, type DifferentialFinding, type DiffEvent, type Sample } from "../api";
 import { PageHeader } from "../components/PageHeader";
@@ -18,6 +19,21 @@ import { useTitle } from "../lib/useTitle";
 
 /** Events shown inline before the rest move behind a disclosure. */
 const INLINE_EVENTS = 4;
+/** How often a queued or running analysis is re-read. */
+const POLL_INTERVAL_MS = 2000;
+
+/** Copy for the results area, by status. Only "completed" may say that nothing differed. */
+const RESULTS_COPY: Record<string, { title: string; body: string }> = {
+  pending: { title: "Analysis queued", body: "Results appear once the baseline and variant runs finish." },
+  running: { title: "Analysis in progress", body: "Results appear once every run finishes." },
+  completed: {
+    title: "No changes recorded",
+    body: "The variant run did not differ from the baseline on any recorded condition.",
+  },
+  failed: { title: "No comparison made", body: "The analysis failed, so no results were produced." },
+  timed_out: { title: "No comparison made", body: "A run timed out, so no results were produced." },
+  cancelled: { title: "No comparison made", body: "The analysis was cancelled, so no results were produced." },
+};
 
 export function DifferentialDetail() {
   const { id = "" } = useParams();
@@ -29,6 +45,17 @@ export function DifferentialDetail() {
     [sampleId]
   );
   useTitle(diff.data ? `Differential #${diff.data.id}` : "Differential");
+
+  // Re-read a queued or running analysis until it reaches a terminal state. The timer is cleared on
+  // unmount and on any load error, including an authentication failure, so polling never outlives
+  // the page or the session.
+  const status = diff.data?.status;
+  const inFlight = status === "pending" || status === "running";
+  useEffect(() => {
+    if (!inFlight || diff.error) return;
+    const timer = window.setTimeout(diff.reload, POLL_INTERVAL_MS);
+    return () => window.clearTimeout(timer);
+  }, [inFlight, diff.error, diff.data, diff.reload]);
 
   if (diff.loading && diff.data === undefined) {
     return <LoadingBlock label="Loading differential analysis" rows={5} />;
@@ -96,12 +123,19 @@ export function DifferentialDetail() {
         </Panel>
       )}
 
+      {d.status === "cancelled" && (
+        <Panel title="Analysis cancelled">
+          <Notice tone="info">{d.error_message ?? "The analysis was cancelled before its runs started."}</Notice>
+        </Panel>
+      )}
+
       {d.findings.length === 0 ? (
         <Panel>
-          <EmptyState icon={GitCompare} title="No changes recorded">
-            {d.status === "completed"
-              ? "The variant run did not differ from the baseline on any recorded condition."
-              : "Results appear here once the analysis finishes."}
+          <EmptyState
+            icon={GitCompare}
+            title={(RESULTS_COPY[d.status] ?? RESULTS_COPY.failed).title}
+          >
+            {(RESULTS_COPY[d.status] ?? RESULTS_COPY.failed).body}
           </EmptyState>
         </Panel>
       ) : (

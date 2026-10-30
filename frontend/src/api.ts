@@ -212,6 +212,9 @@ export interface Job {
   error: string | null;
   duration_ms: number | null;
   submitted_by: number | null;
+  // Set on jobs that belong to a differential analysis.
+  differential_id: number | null;
+  differential_role: "baseline" | "variant" | null;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
