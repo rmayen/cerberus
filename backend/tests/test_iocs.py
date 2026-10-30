@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.analysis.ioc import extract
-from tests.conftest import auth_header
+from tests.conftest import auth_header, run_queued
 
 
 @dataclass
@@ -53,6 +53,7 @@ def _upload_and_run(client: TestClient, headers: dict[str, str]) -> int:
         json={"sample_id": sample_id, "conditions": {"internet": True}},
         headers=headers,
     )
+    run_queued()
     return sample_id
 
 
@@ -97,5 +98,6 @@ def test_iocs_are_deduplicated_across_runs(
         json={"sample_id": sample_id, "conditions": {"internet": True}},
         headers=analyst_headers,
     )
+    run_queued()
     after = len(client.get(f"/api/v1/samples/{sample_id}/iocs", headers=analyst_headers).json())
     assert before == after

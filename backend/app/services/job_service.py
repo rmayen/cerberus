@@ -1,14 +1,15 @@
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from cryptography.fernet import InvalidToken
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from app.analysis.attack import map_findings
 from app.analysis.behavior import analyze
-from app.executors.base import ExecutionRequest, Executor
+from app.executors.base import ExecutionRequest, ExecutionResult, Executor
 from app.executors.registry import UnknownExecutor, get_executor
 from app.models import JOB_TRANSITIONS, AnalysisJob, JobStatus, Sample
 from app.services import attack_service, behavior_service, ioc_service, telemetry_service
@@ -87,6 +88,7 @@ def create_job(
     executor_name: str,
     conditions: dict[str, Any],
     submitted_by: int | None,
+    timeout_seconds: int = 60,
 ) -> AnalysisJob:
     ensure_not_active(db)
     if db.get(Sample, sample_id) is None:
@@ -101,6 +103,7 @@ def create_job(
         executor=executor_name,
         conditions=conditions,
         submitted_by=submitted_by,
+        timeout_seconds=timeout_seconds,
     )
     db.add(job)
     db.flush()
@@ -108,75 +111,53 @@ def create_job(
     return job
 
 
-def run_job(db: Session, job: AnalysisJob, *, timeout_seconds: int = 60) -> AnalysisJob:
-    """Execute a pending job through its executor with a hard timeout, recording
-    the outcome and enforcing safe state transitions."""
-    sample = db.get(Sample, job.sample_id)
-    if sample is None:
-        raise UnknownSample()
-    executor: Executor = get_executor(job.executor)
+def _lease_held(db: Session, job: AnalysisJob, owner: str) -> bool:
+    """True while this owner holds an unexpired lease. Locks the row until the transaction ends.
 
-    try:
-        ensure_not_active(db)
-    except EmergencyStopActive:
-        # Never executed, so cancelled is accurate. The stop was activated after admission.
-        _transition(job, JobStatus.cancelled)
-        job.error = "emergency stop: job was not started"
-        job.finished_at = datetime.now(UTC)
-        db.commit()
+    An expired lease does not count, even before recovery has run, so a late worker cannot
+    complete a job that recovery may already have failed.
+    """
+    row = db.execute(
+        select(AnalysisJob.id)
+        .where(
+            AnalysisJob.id == job.id,
+            AnalysisJob.status == JobStatus.running,
+            AnalysisJob.lease_owner == owner,
+            AnalysisJob.lease_expires_at > datetime.now(UTC),
+        )
+        .with_for_update()
+    ).first()
+    return row is not None
+
+
+def _settle(
+    db: Session,
+    job: AnalysisJob,
+    owner: str | None,
+    status: JobStatus,
+    *,
+    error: str | None,
+    result: ExecutionResult | None = None,
+) -> AnalysisJob:
+    """Write a job's terminal state and results, in one transaction.
+
+    With a lease owner, the write happens only if the lease is still held. A worker that lost its
+    lease discards its result, and whoever recovered the job keeps the status.
+    """
+    if owner is not None and not _lease_held(db, job, owner):
+        db.rollback()
         return job
-    _transition(job, JobStatus.running)
-    job.started_at = datetime.now(UTC)
-    db.commit()  # release the start lock before execution
-
-    try:
-        data = storage.load(sample.sha256)
-    except (OSError, InvalidToken):
-        # Fixed message: OSError text contains the blob path, which must not reach clients.
-        _transition(job, JobStatus.failed)
-        job.error = "sample data unavailable"
-        job.finished_at = datetime.now(UTC)
-        db.commit()  # persist the terminal state before the caller can roll back
-        return job
-
-    request = ExecutionRequest(
-        sample_sha256=sample.sha256,
-        data=data,
-        conditions=job.conditions,
-        timeout_seconds=timeout_seconds,
-    )
-
-    # Not a `with` block: exiting one waits for the worker thread, so a hung executor would block
-    # the request. shutdown(wait=False) returns at once. Python cannot stop the thread, so a
-    # timed-out executor keeps running in the background. Its result is discarded, and only this
-    # function writes the job, so a late result cannot change the recorded status.
-    pool = ThreadPoolExecutor(max_workers=1)
-    try:
-        future = pool.submit(executor.run, request)
-        result = future.result(timeout=timeout_seconds)
-    except TimeoutError:
-        _transition(job, JobStatus.timed_out)
-        job.error = "execution exceeded timeout"
-        job.finished_at = datetime.now(UTC)
-        db.commit()  # persist the terminal state before the caller can roll back
-        return job
-    except Exception as exc:  # executor raised
-        _transition(job, JobStatus.failed)
-        job.error = str(exc)
-        job.finished_at = datetime.now(UTC)
-        db.commit()  # persist the terminal state before the caller can roll back
-        return job
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
-
-    _transition(job, JobStatus.completed if result.status == "completed" else JobStatus.failed)
-    job.result = result.observations
-    job.error = result.error
-    job.duration_ms = result.duration_ms
+    _transition(job, status)
+    job.error = error
     job.finished_at = datetime.now(UTC)
+    if result is not None:
+        job.result = result.observations
+        job.duration_ms = result.duration_ms
     db.flush()
-
-    if job.status == JobStatus.completed:
+    if status == JobStatus.completed and result is not None:
+        sample = db.get(Sample, job.sample_id)
+        if sample is None:
+            raise UnknownSample()
         events = normalize(result.observations)
         findings = analyze(events)
         telemetry_service.store(db, job.id, events)
@@ -189,5 +170,108 @@ def run_job(db: Session, job: AnalysisJob, *, timeout_seconds: int = 60) -> Anal
             sample_sha256=sample.sha256,
             events=events,
         )
-        db.commit()  # persist the terminal state before the caller can roll back
+    db.commit()  # persist the terminal state before any caller can roll back
     return job
+
+
+def run_job(
+    db: Session,
+    job: AnalysisJob,
+    *,
+    timeout_seconds: int | None = None,
+    owner: str | None = None,
+) -> AnalysisJob:
+    """Execute a job through its executor with a hard timeout and record the outcome.
+
+    timeout_seconds=None uses the job's requested timeout. An explicit value overrides it.
+
+    owner=None (inline): the job is admitted and started here, after the stop check.
+    owner set (worker): the job must already be running under this lease owner. Every terminal
+    write is applied only while that lease is still held.
+    """
+    sample = db.get(Sample, job.sample_id)
+    if sample is None:
+        raise UnknownSample()
+    executor: Executor = get_executor(job.executor)
+    timeout = job.timeout_seconds if timeout_seconds is None else timeout_seconds
+
+    if owner is None:
+        try:
+            ensure_not_active(db)
+        except EmergencyStopActive:
+            # Never executed, so cancelled is accurate. The stop was activated after admission.
+            _transition(job, JobStatus.cancelled)
+            job.error = "emergency stop: job was not started"
+            job.finished_at = datetime.now(UTC)
+            db.commit()
+            return job
+        _transition(job, JobStatus.running)
+        job.started_at = datetime.now(UTC)
+        db.commit()  # release the start lock before execution
+
+    try:
+        data = storage.load(sample.sha256)
+    except (OSError, InvalidToken):
+        # Fixed message: OSError text contains the blob path, which must not reach clients.
+        return _settle(db, job, owner, JobStatus.failed, error="sample data unavailable")
+
+    request = ExecutionRequest(
+        sample_sha256=sample.sha256,
+        data=data,
+        conditions=job.conditions,
+        timeout_seconds=timeout,
+    )
+
+    # Not a `with` block: exiting one waits for the worker thread. shutdown(wait=False) returns at
+    # once. Python cannot stop the thread, so a timed-out executor keeps running in the background
+    # and its result is discarded.
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = pool.submit(executor.run, request)
+        result = future.result(timeout=timeout)
+    except TimeoutError:
+        return _settle(db, job, owner, JobStatus.timed_out, error="execution exceeded timeout")
+    except Exception as exc:  # executor raised
+        return _settle(db, job, owner, JobStatus.failed, error=str(exc))
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    status = JobStatus.completed if result.status == "completed" else JobStatus.failed
+    return _settle(db, job, owner, status, error=result.error, result=result)
+
+
+def cancel_queued(db: Session, job_id: int) -> tuple[AnalysisJob | None, str]:
+    """Cancel a job only while it is still queued. Returns (job, outcome).
+
+    Outcomes: "cancelled", "already_cancelled" (idempotent), "not_cancellable", or "not_found".
+    The status check is part of the UPDATE, so it cannot race a worker claim: whichever commits
+    first wins, and the loser sees the new status.
+    """
+    job = db.get(AnalysisJob, job_id)
+    if job is None:
+        return None, "not_found"
+    if job.status == JobStatus.cancelled:
+        return job, "already_cancelled"
+    outcome_rows = cast(
+        CursorResult[Any],
+        db.execute(
+            update(AnalysisJob)
+            .where(AnalysisJob.id == job_id, AnalysisJob.status == JobStatus.pending)
+            .values(
+                status=JobStatus.cancelled,
+                error="cancelled before start",
+                finished_at=datetime.now(UTC),
+            )
+            .execution_options(synchronize_session=False)
+        ),
+    )
+    updated = outcome_rows.rowcount
+    if updated == 1:
+        db.commit()
+        db.refresh(job)
+        return job, "cancelled"
+    db.rollback()
+    job = db.get(AnalysisJob, job_id)
+    if job is not None and job.status == JobStatus.cancelled:
+        return job, "already_cancelled"
+    return job, "not_cancellable"

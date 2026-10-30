@@ -47,7 +47,8 @@ token to obtain new ones.
 
 | Method | Path | Role | Description |
 | ------ | ---- | ---- | ----------- |
-| POST | `/jobs` | analyst+ | Submit and run an analysis job |
+| POST | `/jobs` | analyst+ | Queue an analysis job (`timeout_seconds`, 1–3600, default 60). Runs in the worker. Returns `pending`. |
+| POST | `/jobs/{id}/cancel` | analyst+ (submitter or admin) | Cancel a pending job. Idempotent. `409` if running or finished. |
 | GET | `/jobs` | viewer+ | List / filter jobs |
 | GET | `/jobs/{id}` | viewer+ | Job detail and result |
 | GET | `/jobs/{id}/telemetry` | viewer+ | Normalized telemetry (filter by `category`) |

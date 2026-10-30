@@ -143,6 +143,7 @@ class JobRead(BaseModel):
     sample_id: int
     executor: str
     conditions: dict[str, object]
+    timeout_seconds: int
     status: JobStatus
     result: dict[str, object] | None
     error: str | None

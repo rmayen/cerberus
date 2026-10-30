@@ -28,8 +28,9 @@ Upload -> Quarantine -> Scheduler -> Disposable VM (executor)
 The backend is organized as a single FastAPI package (`backend/app`) with
 sub-packages per concern (`executors`, `telemetry`, `analysis`, `reports`),
 rather than separate deployable services, which keeps the current scope simple.
-A background worker and a real disposable-VM executor are future work (see
-[ROADMAP](ROADMAP.md)).
+Simulated jobs run in a separate worker process (`python -m app.worker`, PostgreSQL
+required), not in the HTTP request. A real disposable-VM executor is future work (see
+[ROADMAP](ROADMAP.md)). The README's job queue section describes leases and recovery.
 
 ## Execution backend is pluggable
 
