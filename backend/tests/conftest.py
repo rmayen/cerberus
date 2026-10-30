@@ -49,11 +49,14 @@ def db_session() -> Iterator[Session]:
 
 def run_queued() -> int:
     """Process queued jobs in the test database, as the worker process would."""
+    from app.services.differential_service import finalize_ready
     from app.services.worker_service import drain
 
     queue_session: Session | None = getattr(app.state, "queue_session", None)
     assert queue_session is not None, "run_queued needs the client fixture"
-    return drain(queue_session, owner="test-worker")
+    processed = drain(queue_session, owner="test-worker")
+    finalize_ready(queue_session)
+    return processed
 
 
 @pytest.fixture()

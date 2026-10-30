@@ -149,6 +149,8 @@ class JobRead(BaseModel):
     error: str | None
     duration_ms: int | None
     submitted_by: int | None
+    differential_id: int | None
+    differential_role: str | None
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None

@@ -173,6 +173,10 @@ class AnalysisJob(Base):
     lease_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Set on jobs that belong to a differential analysis: "baseline", or "variant" with the
+    # variation it applies. The analysis compares variant results against the baseline.
+    differential_role: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    differential_variation: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
@@ -187,6 +191,12 @@ class DifferentialAnalysis(Base):
     )
     executor: Mapped[str] = mapped_column(String(32), default="simulated")
     baseline_conditions: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Requested variations and timeout. The queued child jobs carry the same values; these are
+    # kept here so the analysis still shows what was asked for after the jobs finish.
+    variations: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    timeout_seconds: Mapped[int] = mapped_column(
+        Integer, default=60, server_default="60", nullable=False
+    )
     status: Mapped[JobStatus] = mapped_column(
         Enum(JobStatus), default=JobStatus.pending, nullable=False
     )

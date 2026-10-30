@@ -17,6 +17,7 @@ from app.executors.simulated import SimulatedExecutor
 from app.models import AnalysisJob, DifferentialAnalysis, DifferentialFinding, JobStatus
 from app.services import differential_service, emergency_service, job_service
 from app.services.emergency_service import EmergencyStopActive
+from app.services.worker_service import drain
 from tests.test_postgres_emergency_stop import (  # noqa: F401  (fixtures)
     PG_URL,
     _sample,
@@ -45,32 +46,34 @@ class GatedExecutor(SimulatedExecutor):
         return super().run(request)
 
 
-def test_activation_during_baseline_run_stops_variant_without_blocking(
+def test_activation_during_baseline_run_stops_queued_variants_without_blocking(
     pg_engine, make_session, monkeypatch
 ) -> None:
     monkeypatch.setattr(job_service.storage, "load", lambda sha: b"MZ")
     gated = GatedExecutor()
     monkeypatch.setitem(registry._EXECUTORS, "gated", gated)
     sample_id = _sample(make_session, "c" * 64)
-    result: dict[str, object] = {}
+    with make_session() as s:
+        analysis_id = differential_service.enqueue(
+            s,
+            sample_id=sample_id,
+            baseline_conditions={"gate": "baseline"},
+            variations=[{"internet": False}],
+            executor_name="gated",
+            submitted_by=None,
+            timeout_seconds=30,
+        ).id
+    errors: list[BaseException] = []
 
-    def submit() -> None:
-        with make_session() as s:
-            analysis = differential_service.run_differential(
-                s,
-                sample_id=sample_id,
-                baseline_conditions={"gate": "baseline"},
-                variations=[{"internet": False}],
-                executor_name="gated",
-                submitted_by=None,
-                timeout_seconds=30,
-            )
-            result["status"] = analysis.status
-            result["error"] = analysis.error_message
-            result["id"] = analysis.id
+    def worker() -> None:
+        try:
+            with make_session() as s:
+                drain(s, owner="w1")  # claims the gated baseline, then tries the variant
+        except BaseException as exc:
+            errors.append(exc)
 
-    worker = threading.Thread(target=submit)
-    worker.start()
+    thread = threading.Thread(target=worker)
+    thread.start()
     try:
         assert gated.started.wait(10), "baseline run never started"
         # The baseline is executing. Activation must commit now, without waiting for it.
@@ -81,15 +84,17 @@ def test_activation_during_baseline_run_stops_variant_without_blocking(
         assert time.monotonic() - began < 5, "activation blocked behind a running analysis"
     finally:
         gated.release.set()
-    worker.join(30)
+    thread.join(30)
+    assert errors == []
 
-    assert result["status"] == JobStatus.failed
-    assert result["error"] == differential_service.EMERGENCY_MID_RUN
-    assert gated.calls == 1, "no variant run may execute after activation"
+    assert gated.calls == 1, "no variant may start after activation"
     with make_session() as s:
-        jobs = s.query(AnalysisJob).order_by(AnalysisJob.id).all()
-        assert [j.status for j in jobs] == [JobStatus.completed]
+        jobs = s.query(AnalysisJob).filter_by(differential_id=analysis_id).order_by(AnalysisJob.id)
+        assert [j.status for j in jobs] == [JobStatus.completed, JobStatus.pending]
+        analysis = s.get(DifferentialAnalysis, analysis_id)
+        assert analysis.status == JobStatus.running  # queued work preserved, not failed
         assert s.query(DifferentialFinding).count() == 0
+        assert differential_service.finalize_ready(s) == 0  # the variant is still queued
 
 
 def test_concurrent_differential_submissions_end_in_consistent_terminal_states(
@@ -105,7 +110,7 @@ def test_concurrent_differential_submissions_end_in_consistent_terminal_states(
         while not stop.is_set():
             s = make_session()
             try:
-                differential_service.run_differential(
+                differential_service.enqueue(
                     s,
                     sample_id=sample_id,
                     baseline_conditions={"internet": True},
@@ -135,25 +140,28 @@ def test_concurrent_differential_submissions_end_in_consistent_terminal_states(
     with make_session() as s:
         analyses = s.query(DifferentialAnalysis).all()
         assert analyses, "some analyses should have been admitted before activation"
-        assert all(a.status in (JobStatus.completed, JobStatus.failed) for a in analyses)
-        for analysis in analyses:
-            count = s.query(DifferentialFinding).filter_by(analysis_id=analysis.id).count()
-            if analysis.status == JobStatus.failed:
-                assert count == 0, "failed analyses must not carry findings"
-        active_jobs = (
+        for analysis in analyses:  # every admitted analysis has its full set of child jobs
+            jobs = s.query(AnalysisJob).filter_by(differential_id=analysis.id).all()
+            assert len(jobs) == 2
+        assert all(a.status == JobStatus.pending for a in analyses)
+        assert refused, "admissions during the stop must be refused"
+
+    with make_session() as s:  # stop cleared by a fresh administrator change
+        emergency_service.set_active(s, active=False, actor_id=1)
+        s.commit()
+    with make_session() as s:
+        drain(s, owner="w1")
+    with make_session() as s:  # finalize_ready handles a bounded batch per call, as the worker does
+        while differential_service.finalize_ready(s):
+            pass
+    with make_session() as s:
+        statuses = [a.status for a in s.query(DifferentialAnalysis).all()]
+        assert statuses and all(st == JobStatus.completed for st in statuses)
+        assert (
             s.query(AnalysisJob)
             .filter(AnalysisJob.status.in_([JobStatus.pending, JobStatus.running]))
             .count()
-        )
-        assert active_jobs == 0
-    with make_session() as s, pytest.raises(EmergencyStopActive):
-        differential_service.run_differential(
-            s,
-            sample_id=sample_id,
-            baseline_conditions={},
-            variations=[{"internet": False}],
-            executor_name="simulated",
-            submitted_by=None,
+            == 0
         )
 
 

@@ -133,14 +133,23 @@ and does not execute anything. A separate worker process runs queued jobs.
 - **Timeouts.** `timeout_seconds` (1–3600, default 60) is stored with the job
   and enforced by the worker. An execution that exceeds it is marked `timed_out`.
   Python cannot stop the executing thread, so its result is discarded and the
-  thread may run on in the background. Differential analyses still execute
-  inside the HTTP request and keep their own timeout.
+  thread may run on in the background.
 - **Leases and recovery.** A claimed job holds a 30-second lease. A heartbeat
   renews it every 10 seconds while the job runs. If a worker stops renewing it
   for longer than the lease (crash, hang, or lost database connection), the next
   worker loop marks the job `failed` with the message
   `worker lease expired; outcome unknown, not re-executed`. Jobs are never
   re-run automatically. A worker whose lease has expired cannot record a result.
+- **Differential analyses** are queued the same way. `POST /api/v1/differential`
+  queues the baseline and one job per variation, and returns `pending`. Workers
+  run those jobs, then finalize the analysis once every job is terminal. Findings
+  come only from completed jobs. If any job failed, timed out, or was cancelled,
+  the analysis fails and records no findings or confidence. Variants become
+  claimable only after the baseline completes. If the baseline fails or times out,
+  its variants are cancelled unrun.
+  `POST /api/v1/differential/{id}/cancel` cancels an analysis only while all of its
+  jobs are still pending (`409` otherwise). Cancelling a single queued job that
+  belongs to an analysis is refused; cancel the analysis instead.
 - **Cancellation.** `POST /api/v1/jobs/{id}/cancel` by the submitter or an
   administrator cancels a **pending** job. It is idempotent: cancelling an
   already cancelled job returns `200`. A running or finished job returns `409`.
@@ -155,7 +164,8 @@ refuses to start unless `CERBERUS_DATABASE_URL` is a PostgreSQL URL. The API and
 unit tests still run on SQLite for development.
 
 Not included: worker supervision, automatic restarts, deployment configuration,
-and termination of running work. A downgrade of migration `7c1e4b2d9a80` drops
+and termination of running work. A differential analysis whose job was recovered
+after a crash fails; its remaining jobs still run, and no job is retried. A downgrade of migration `7c1e4b2d9a80` drops
 the stored timeouts, so requeued jobs then use the 60-second default.
 
 ## Documentation

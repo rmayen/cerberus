@@ -5,7 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.analysis.differential import compare
-from tests.conftest import auth_header
+from tests.conftest import auth_header, run_queued
 
 
 @dataclass
@@ -65,7 +65,10 @@ def test_differential_detects_internet_dependency(
         headers=analyst_headers,
     )
     assert response.status_code == 201, response.text
-    body = response.json()
+    assert response.json()["status"] == "pending"  # queued, not run in the request
+    run_queued()
+    analysis_id = response.json()["id"]
+    body = client.get(f"/api/v1/differential/{analysis_id}", headers=analyst_headers).json()
     assert body["status"] == "completed"
 
     by_axis = {f["axis"]: f for f in body["findings"]}
