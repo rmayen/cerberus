@@ -48,7 +48,7 @@ token to obtain new ones.
 | Method | Path | Role | Description |
 | ------ | ---- | ---- | ----------- |
 | POST | `/jobs` | analyst+ | Queue an analysis job (`timeout_seconds`, 1–3600, default 60). Runs in the worker. Returns `pending`. |
-| POST | `/jobs/{id}/cancel` | analyst+ (submitter or admin) | Cancel a pending job. Idempotent. `409` if running or finished. |
+| POST | `/jobs/{id}/cancel` | analyst+ (submitter or admin) | Cancel a pending job (`200`, idempotent). A running job returns `202` with a stop request; it becomes `cancelled` only after its child process is verified stopped. `409` if finished. Differential child jobs return `409`: cancel the analysis instead. |
 | GET | `/jobs` | viewer+ | List / filter jobs |
 | GET | `/jobs/{id}` | viewer+ | Job detail and result |
 | GET | `/jobs/{id}/telemetry` | viewer+ | Normalized telemetry (filter by `category`) |

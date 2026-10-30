@@ -4,8 +4,6 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.executors import registry
-from app.executors.base import ExecutionRequest, ExecutionResult
 from app.models import AnalysisJob, JobStatus, Sample
 from app.services import job_service
 from tests.conftest import auth_header, run_queued
@@ -94,18 +92,7 @@ def test_viewer_cannot_submit_job(client: TestClient, admin: dict[str, str]) -> 
 def test_timeout_marks_job_timed_out(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A slow executor that ignores the deadline; job_service must time it out.
-    class SlowExecutor:
-        name = "slow"
-
-        def run(self, request: ExecutionRequest) -> ExecutionResult:
-            import time
-
-            time.sleep(5)
-            return ExecutionResult(status="completed", duration_ms=0, observations={})
-
-    monkeypatch.setitem(registry._EXECUTORS, "slow", SlowExecutor())
-
+    # The "hanging" fixture executor sleeps past any limit; the child process must be stopped.
     sample = Sample(
         sha256="c" * 64,
         filename="s.bin",
@@ -115,11 +102,10 @@ def test_timeout_marks_job_timed_out(
     )
     db_session.add(sample)
     db_session.flush()
-    job = AnalysisJob(sample_id=sample.id, executor="slow", conditions={})
+    job = AnalysisJob(sample_id=sample.id, executor="hanging", conditions={})
     db_session.add(job)
     db_session.flush()
 
-    # Storage isn't needed because the slow executor never reads it; patch load.
     monkeypatch.setattr(job_service.storage, "load", lambda sha: b"MZ")
     job_service.run_job(db_session, job, timeout_seconds=1)
     assert job.status == JobStatus.timed_out

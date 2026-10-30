@@ -12,8 +12,9 @@ Guarantees, on PostgreSQL only:
 - A worker whose lease has expired or was recovered cannot write its result (see job_service).
 SQLite has no row locks, so its results are best-effort only and must not be used for production.
 
-Running work cannot be terminated. The emergency stop blocks new claims but does not stop a job
-that is already executing.
+Each running job executes in a child process. The heartbeat terminates that child when its lease
+is lost, a cancel is requested, or the emergency stop is active. The emergency stop also blocks new
+claims. A job is recorded cancelled or timed out only after its child process is verified stopped.
 """
 
 import logging
@@ -29,12 +30,13 @@ from sqlalchemy.orm import Session, aliased
 from sqlalchemy.sql import ColumnElement
 
 from app.models import AnalysisJob, DifferentialAnalysis, JobStatus
+from app.services import emergency_service, process_runner
 from app.services.emergency_service import EmergencyStopActive, ensure_not_active
 from app.services.job_service import _transition, run_job
 
 RECOVERY_MESSAGE = "worker lease expired; outcome unknown, not re-executed"
 LEASE_DURATION = timedelta(seconds=30)
-HEARTBEAT_INTERVAL = timedelta(seconds=10)
+HEARTBEAT_INTERVAL = timedelta(seconds=2)
 
 logger = logging.getLogger(__name__)
 
@@ -122,12 +124,15 @@ def renew_lease(db: Session, job_id: int, *, owner: str, lease: timedelta = LEAS
 
 
 class LeaseHeartbeat:
-    """Renews a job's lease from a background thread while the job executes.
+    """Keeps a running job's lease alive and signals its child process to stop when needed.
 
-    The thread uses its own session from session_factory, because the worker's session is busy
-    running the job. The thread stops when the context exits, or when a renewal finds the lease
-    gone. A failed renewal is logged and retried on the next tick. If renewals keep failing, the
-    lease expires and recovery marks the job failed.
+    Each tick runs in its own session from session_factory, because the worker's session is busy
+    running the job. A tick stops the child, through the CancelSignal, when:
+    - the lease is no longer held (expired or recovered): the worker must not finish the job;
+    - a cancel was requested for the job;
+    - the emergency stop is active.
+    A failed renewal query is logged and retried on the next tick. If the database stays
+    unreachable, the lease expires and recovery marks the job failed.
     """
 
     def __init__(
@@ -138,30 +143,38 @@ class LeaseHeartbeat:
         owner: str,
         lease: timedelta = LEASE_DURATION,
         interval: timedelta = HEARTBEAT_INTERVAL,
+        cancel: process_runner.CancelSignal | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._job_id = job_id
         self._owner = owner
         self._lease = lease
         self._interval = interval.total_seconds()
+        self.cancel = cancel or process_runner.CancelSignal()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name=f"heartbeat-{job_id}", daemon=True)
+
+    def _tick(self) -> bool:
+        """One heartbeat. Returns False when the thread should stop."""
+        with self._session_factory() as session:
+            if not renew_lease(session, self._job_id, owner=self._owner, lease=self._lease):
+                self.cancel.set("worker lease was lost")
+                return False
+            if _cancel_requested(session, self._job_id):
+                self.cancel.set("cancelled while running")
+                return False
+            if emergency_service.is_active(session):
+                self.cancel.set("emergency stop: execution terminated")
+                return False
+        return True
 
     def _run(self) -> None:
         while not self._stop.wait(self._interval):
             try:
-                with self._session_factory() as session:
-                    renewed = renew_lease(
-                        session, self._job_id, owner=self._owner, lease=self._lease
-                    )
+                if not self._tick():
+                    return
             except SQLAlchemyError:
-                logger.warning("lease renewal failed for job %s; will retry", self._job_id)
-                continue
-            if not renewed:
-                logger.warning(
-                    "lease for job %s is no longer held; heartbeat stopped", self._job_id
-                )
-                return
+                logger.warning("heartbeat check failed for job %s; will retry", self._job_id)
 
     def __enter__(self) -> "LeaseHeartbeat":
         self._thread.start()
@@ -170,6 +183,14 @@ class LeaseHeartbeat:
     def __exit__(self, *exc_info: object) -> None:
         self._stop.set()
         self._thread.join()
+
+
+def _cancel_requested(session: Session, job_id: int) -> bool:
+    return bool(
+        session.execute(
+            select(AnalysisJob.cancel_requested).where(AnalysisJob.id == job_id)
+        ).scalar()
+    )
 
 
 def recover_expired_leases(db: Session, *, now: datetime | None = None) -> int:
@@ -214,8 +235,8 @@ def process_next(
         return None
     if session_factory is None:
         return run_job(db, job, owner=owner)
-    with LeaseHeartbeat(session_factory, job_id, owner=owner):
-        return run_job(db, job, owner=owner)
+    with LeaseHeartbeat(session_factory, job_id, owner=owner) as heartbeat:
+        return run_job(db, job, owner=owner, cancel=heartbeat.cancel)
 
 
 def drain(

@@ -1,14 +1,12 @@
 """Queued differential analyses: cancellation, child-job rules, crash recovery, finalization."""
 
-import threading
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.executors import registry
-from app.executors.base import ExecutionRequest, ExecutionResult
 from app.models import AnalysisJob, DifferentialAnalysis, DifferentialFinding, JobStatus, Sample
 from app.services import differential_service, job_service
 from app.services.worker_service import claim_next, process_next, recover_expired_leases
@@ -183,45 +181,26 @@ def test_variant_is_claimable_only_after_its_baseline_completes(
     assert claim_next(db_session, owner="w2") == variant_id
 
 
-class _RecordingExecutor:
-    """Harmless test executor that hangs on every run and counts how many it started."""
-
-    name = "recording"
-
-    def __init__(self) -> None:
-        self.calls = 0
-        self.release = threading.Event()
-
-    def run(self, request: ExecutionRequest) -> ExecutionResult:
-        self.calls += 1
-        self.release.wait(10)
-        return ExecutionResult(status="completed", duration_ms=0, observations={})
-
-
 def test_timed_out_baseline_fails_analysis_and_never_runs_variants(
     client: TestClient,
     people: dict[str, dict[str, str]],
     sample: int,
     db_session: Session,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    recording = _RecordingExecutor()
-    monkeypatch.setitem(registry._EXECUTORS, recording.name, recording)
+    log = tmp_path / "runs.log"  # each child run appends one line, across processes
     analysis = differential_service.enqueue(
         db_session,
         sample_id=sample,
-        baseline_conditions={},
+        baseline_conditions={"mode": "hang", "log": str(log)},
         variations=[{"internet": False}, {"existing_mutex": True}],
-        executor_name="recording",
+        executor_name="scripted",
         submitted_by=None,
         timeout_seconds=1,
     )
-    try:
-        run_queued()
-    finally:
-        recording.release.set()
+    run_queued()
 
-    assert recording.calls == 1, "only the baseline may start"
+    assert log.read_text().count("run") == 1, "only the baseline may start"
     db_session.refresh(analysis)
     assert analysis.status == JobStatus.failed
     assert analysis.error_message == "Baseline run timed out. The other runs were not compared."

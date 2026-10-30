@@ -12,7 +12,9 @@ from sqlalchemy.pool import StaticPool
 # explicit test-only values, set before the app is imported. Values already in the environment win.
 os.environ.setdefault("CERBERUS_JWT_SECRET", "test-only-jwt-secret-not-for-deployment-0123456789")
 os.environ.setdefault("CERBERUS_STORAGE_KEY", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
-
+# Executor children import these modules too, so the test executors run in child processes.
+os.environ.setdefault("CERBERUS_EXECUTOR_MODULES", "tests.executor_fixtures")
+import tests.executor_fixtures  # noqa: E402,F401  (registers the harmless test executors)
 from app.config import settings
 from app.database import Base, get_db
 from app.main import app

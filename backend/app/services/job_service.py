@@ -1,4 +1,3 @@
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -9,10 +8,16 @@ from sqlalchemy.orm import Session
 
 from app.analysis.attack import map_findings
 from app.analysis.behavior import analyze
-from app.executors.base import ExecutionRequest, ExecutionResult, Executor
+from app.executors.base import ExecutionResult
 from app.executors.registry import UnknownExecutor, get_executor
 from app.models import JOB_TRANSITIONS, AnalysisJob, JobStatus, Sample
-from app.services import attack_service, behavior_service, ioc_service, telemetry_service
+from app.services import (
+    attack_service,
+    behavior_service,
+    ioc_service,
+    process_runner,
+    telemetry_service,
+)
 from app.services.emergency_service import EmergencyStopActive, ensure_not_active
 from app.storage import storage
 from app.telemetry.normalizer import normalize
@@ -180,6 +185,7 @@ def run_job(
     *,
     timeout_seconds: int | None = None,
     owner: str | None = None,
+    cancel: process_runner.CancelSignal | None = None,
 ) -> AnalysisJob:
     """Execute a job through its executor with a hard timeout and record the outcome.
 
@@ -192,7 +198,7 @@ def run_job(
     sample = db.get(Sample, job.sample_id)
     if sample is None:
         raise UnknownSample()
-    executor: Executor = get_executor(job.executor)
+    get_executor(job.executor)  # validates the executor name before any work starts
     timeout = job.timeout_seconds if timeout_seconds is None else timeout_seconds
 
     if owner is None:
@@ -210,34 +216,65 @@ def run_job(
         db.commit()  # release the start lock before execution
 
     try:
-        data = storage.load(sample.sha256)
+        storage.load(
+            sample.sha256
+        )  # the sample must still be readable; its bytes are not passed on
     except (OSError, InvalidToken):
         # Fixed message: OSError text contains the blob path, which must not reach clients.
         return _settle(db, job, owner, JobStatus.failed, error="sample data unavailable")
 
-    request = ExecutionRequest(
+    outcome = process_runner.run_in_child(
+        executor_name=job.executor,
         sample_sha256=sample.sha256,
-        data=data,
         conditions=job.conditions,
         timeout_seconds=timeout,
+        cancel=cancel,
     )
+    if outcome.kind == "timed_out":
+        return _settle(db, job, owner, JobStatus.timed_out, error=outcome.error)
+    if outcome.kind == "cancelled":
+        return _settle(db, job, owner, JobStatus.cancelled, error=outcome.error)
+    if outcome.observations is None:
+        return _settle(db, job, owner, JobStatus.failed, error=outcome.error)
+    result = ExecutionResult(
+        status="completed" if outcome.kind == "completed" else "failed",
+        duration_ms=outcome.duration_ms,
+        observations=outcome.observations,
+        error=outcome.error,
+    )
+    status = JobStatus.completed if outcome.kind == "completed" else JobStatus.failed
+    return _settle(db, job, owner, status, error=outcome.error, result=result)
 
-    # Not a `with` block: exiting one waits for the worker thread. shutdown(wait=False) returns at
-    # once. Python cannot stop the thread, so a timed-out executor keeps running in the background
-    # and its result is discarded.
-    pool = ThreadPoolExecutor(max_workers=1)
-    try:
-        future = pool.submit(executor.run, request)
-        result = future.result(timeout=timeout)
-    except TimeoutError:
-        return _settle(db, job, owner, JobStatus.timed_out, error="execution exceeded timeout")
-    except Exception as exc:  # executor raised
-        return _settle(db, job, owner, JobStatus.failed, error=str(exc))
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
 
-    status = JobStatus.completed if result.status == "completed" else JobStatus.failed
-    return _settle(db, job, owner, status, error=result.error, result=result)
+def request_cancel_running(db: Session, job_id: int) -> tuple[AnalysisJob | None, str]:
+    """Ask the worker to stop a running job. Returns (job, outcome).
+
+    Outcomes: "requested" (set now), "already_requested", "not_running", or "not_found". The job
+    stays running until its child process is confirmed stopped. Only then does it become cancelled.
+    """
+    job = db.get(AnalysisJob, job_id)
+    if job is None:
+        return None, "not_found"
+    updated = cast(
+        CursorResult[Any],
+        db.execute(
+            update(AnalysisJob)
+            .where(
+                AnalysisJob.id == job_id,
+                AnalysisJob.status == JobStatus.running,
+                AnalysisJob.cancel_requested.is_(False),
+            )
+            .values(cancel_requested=True)
+            .execution_options(synchronize_session=False)
+        ),
+    ).rowcount
+    db.commit()
+    db.refresh(job)
+    if updated == 1:
+        return job, "requested"
+    if job.status == JobStatus.running and job.cancel_requested:
+        return job, "already_requested"
+    return job, "not_running"
 
 
 def cancel_queued(db: Session, job_id: int) -> tuple[AnalysisJob | None, str]:

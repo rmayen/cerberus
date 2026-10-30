@@ -216,7 +216,7 @@ def _finalize(db: Session, analysis: DifferentialAnalysis, jobs: list[AnalysisJo
         label = "Variant" if culprit and culprit.differential_role == "variant" else "Baseline"
         verb = {
             JobStatus.timed_out: "timed out",
-            JobStatus.cancelled: "was not started",
+            JobStatus.cancelled: "was cancelled",
         }.get(culprit.status if culprit else JobStatus.failed, "failed")
         analysis.status = JobStatus.failed
         analysis.error_message = f"{label} run {verb}. The other runs were not compared."
